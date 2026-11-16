@@ -214,6 +214,14 @@ jobs:
             exit 1
           fi
 
+      - name: Gate — verify artifact is installable on tvOS
+        run: |
+          # 这一步是唯一的「能装吗」判据。
+          # 上面 xcodebuild 成功、zip 成功都不能证明包可用；
+          # 真正决定因素是字节里的平台/加密状态/多播权限。
+          python3 --version
+          python3 scripts/check_tipa.py UnCast.tipa
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
