@@ -18,13 +18,28 @@ final class SSDPResponder {
     // MARK: - 配置
 
     struct Config {
-        var multicastGroup = "239.255.255.250"
+        var multicastGroup: String = "239.255.255.250"
         var port: UInt16 = 1900
         /// 本机对外提供 device description 的 HTTP 端口
         var httpPort: UInt16 = 9030
         /// 设备 UUID，应持久化以保证设备识别稳定
         var uuid: String
         var friendlyName: String
+
+        /// 显式 init：memberwise init 要求实参严格按声明顺序，
+        /// 调用方按语义顺序（uuid → friendlyName → httpPort）传更自然，
+        /// 这里给出一个顺序无关的入口。
+        init(uuid: String,
+             friendlyName: String,
+             httpPort: UInt16 = 9030,
+             multicastGroup: String = "239.255.255.250",
+             port: UInt16 = 1900) {
+            self.uuid = uuid
+            self.friendlyName = friendlyName
+            self.httpPort = httpPort
+            self.multicastGroup = multicastGroup
+            self.port = port
+        }
     }
 
     private let config: Config
