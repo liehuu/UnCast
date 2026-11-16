@@ -310,7 +310,12 @@ final class DLNAService: ObservableObject {
             return []
 
         case "Stop":
-            engine.stop()
+            // 标记为远端 Stop：若 engine.ignoreRemoteStop 开启则会被忽略，
+            // 避免手机退出播放页时把电视上的播放一起停掉
+            engine.stop(isRemote: true)
+            if engine.ignoreRemoteStop {
+                appendLogOnMain("⏭ 已忽略手机端 Stop（配置：手机退出不影响电视）")
+            }
             return []
 
         case "Seek":
