@@ -31,22 +31,102 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 
 ## 构建与安装
 
-### 方式一：GitHub Actions 出 tipa（推荐）
+### 已构建好的包
+
+仓库 `dist/UnCast-1.0.0.tipa` 就是可直接安装的成品（由 GitHub Actions 构建）。
+
+| 项 | 值 |
+|---|---|
+| 大小 | 280,483 字节（0.27 MB） |
+| sha256 | `5dd5a3469b393502eb3aad944008a27f3624806b1e057f77f022fe06326736a9` |
+| 架构 | arm64 |
+| 平台 | tvOS（`LC_BUILD_VERSION.platform = 3`，minos 15.0） |
+| 加密 | 未加密（`cryptid = 0`） |
+| 签名 | ad-hoc（含 `LC_CODE_SIGNATURE`） |
+| 多播权限 | `com.apple.developer.networking.multicast = true` |
+
+### TrollStore 安装步骤
+
+1. 把 `UnCast-1.0.0.tipa` 传到 iPhone / iPad，或用「文件」App 存到 iCloud Drive
+2. 在 Apple TV 上打开 TrollStore → **Install from File**（或通过 Filza / 局域网上传）
+3. 选中 `UnCast-1.0.0.tipa` → 安装
+4. 首次启动会询问「本地网络」权限，**必须允许**，否则收不到投屏
+
+> 为什么不用 App Store 的 ipa：App Store 下发的 tvOS 二进制带 FairPlay 加密
+> （`cryptid != 0`），装到非授权设备上会直接崩。必须自构建未加密包。
+
+### 方式一：GitHub Actions 出 tipa
 
 1. 把本目录推到 GitHub 仓库
 2. Actions 会自动跑 `Build UnCast tipa`
 3. 下载 artifact `UnCast-tipa`
 4. 传到 Apple TV，用 TrollStore 打开安装
 
+CI 里有两道关卡，任意一道不通过都会变红并阻止上传：
+
+- `Ad-hoc sign with entitlements` — 用 `ldid -S` 把多播权限写进二进制
+- `Gate — verify artifact is installable on tvOS` — 跑 `scripts/check_tipa.py`，
+  直接读原始字节校验平台 / 加密状态 / 权限
+
 ### 方式二：本地 Mac
 
 ```bash
-brew install xcodegen
-cd UnCast
+brew install xcodegen ldid
 xcodegen generate
-open UnCast.xcodeproj
-# Xcode 里选你的 Apple TV 跑
+xcodebuild -project UnCast.xcodeproj -scheme UnCast -sdk appletvos \
+  -configuration Release CODE_SIGNING_ALLOWED=NO build
+# 之后手动 ldid -SUnCast/App/UnCast.entitlements <产物>/UnCast.app/UnCast
+# 再用 scripts/check_tipa.py 验证
 ```
+
+---
+
+## 手机离开后继续播放（重点）
+
+用户最关心的一条：**手机锁屏、切后台、退出投屏 App，电视上的播放不能中断。**
+
+这条在 DLNA 架构下**天然成立**，原因是：
+
+```
+手机 App                    源站                      Apple TV
+   │                          │                          │
+   │ ① 把 URL 发给电视 ─────────────────────────────────▶ │
+   │    (SetAVTransportURI)   │                          │
+   │                          │ ② 电视自己拉流 ─────────▶ │
+   │                          │◀──────────────────────── │
+   │ ③ 只发控制指令（Play/Pause/Seek）                    │
+   │    手机在这里关机也不会影响 ② 的已经建立的连接         │
+```
+
+电视是**自己**从源站拉流的，手机只负责下发指令。所以手机退出不会掐断数据流。
+
+真正会中断播放的只有两类情况，本项目都做了处理：
+
+| 风险 | 处理方式 | 代码位置 |
+|---|---|---|
+| 客户端退出时主动发 `AVTransport Stop` | `ignoreRemoteStop` 开关（默认开），远端 Stop 被忽略并计数 | `PlaybackEngine.stop(isRemote:)` |
+| 音频被系统打断（来电、其他 App 抢占） | 监听 `AVAudioSession.interruptionNotification`，结束后自动续播 | `PlaybackEngine.setupLifecycleHandling()` |
+| 网络瞬时抖动 | 前向缓冲 30 秒 + 允许暂停时继续缓冲 + 自动等待缓冲 + 瞬时错误重试一次 | `loadAndPlay` / `scheduleRetryIfTransient` |
+| App 被系统挂起 | `UIBackgroundModes = ["audio"]`，后台保持出声 | `Info.plist` |
+
+设置页有一个开关「手机退出后继续播放」，默认开启。关掉后行为退回标准 DLNA
+（远端 Stop 立即生效），用于那些确实需要「手机停、电视也停」的场景。
+
+播放界面右上角会显示 **「已保护 N 次」**，即拦下了多少次远端 Stop，
+可以用来确认这个机制真的在工作。
+
+### 验证方式
+
+`scripts/verify_cast.py` 对协议行为做了端到端断言，其中用例 1 就是这条诉求，
+并配了反向用例防止「断言恒真」：
+
+```bash
+python3 scripts/verify_cast.py      # 全部通过
+python3 scripts/verify_injection.py # 反向注入，证明断言能失败
+```
+
+反向注入的结果：故意把 `stop()` 改成「收到 Stop 就停」后，
+有 6 条断言变红；改回后复跑全绿。这说明这些断言不是装饰。
 
 ---
 
