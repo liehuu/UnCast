@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 组播接收：DLNA/SSDP 发现必需。TrollStore 签名可保留此 entitlement，
+	     正常个人免费签名无法获得（需向 Apple 申请审批）。 -->
+	<key>com.apple.developer.networking.multicast</key>
+	<true/>
+	<!-- 允许后台播放，保持投屏接收常驻 -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>
