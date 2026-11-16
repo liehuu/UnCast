@@ -37,13 +37,18 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 
 | 项 | 值 |
 |---|---|
-| 大小 | 280,483 字节（0.27 MB） |
-| sha256 | `5dd5a3469b393502eb3aad944008a27f3624806b1e057f77f022fe06326736a9` |
+| 大小 | 280,642 字节（0.27 MB） |
+| sha256 | `ec3b5738c9e209498ea045d41178cfe649e2c34fb24a4aebba3dcecfa0cf07d5` |
 | 架构 | arm64 |
 | 平台 | tvOS（`LC_BUILD_VERSION.platform = 3`，minos 15.0） |
 | 加密 | 未加密（`cryptid = 0`） |
 | 签名 | ad-hoc（含 `LC_CODE_SIGNATURE`） |
 | 多播权限 | `com.apple.developer.networking.multicast = true` |
+
+下载：<https://github.com/liehuu/UnCast/releases/download/v1.0.0/UnCast-1.0.0.tipa>
+
+上述指标是读 tipa 内二进制的原始字节实测得出，可用
+`python3 scripts/check_tipa.py <tipa>` 自行复现（16 项断言）。
 
 ### TrollStore 安装步骤
 
