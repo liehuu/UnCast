@@ -12,7 +12,6 @@ struct SettingsView: View {
     @AppStorage("uncast.ignoreRemoteStop") private var ignoreRemoteStop = true
 
     @State private var showAddressAlert = false
-    @State private var didSyncEngineFlags = false
 
     var body: some View {
         NavigationView {
@@ -138,14 +137,11 @@ struct SettingsView: View {
             }
             .navigationTitle("设置")
             .onAppear {
-                // 把持久化设置同步到引擎（只做一次，避免覆盖运行时修改）
-                if !didSyncEngineFlags {
-                    engine.ignoreRemoteStop = ignoreRemoteStop
-                    if let m = PlaybackEngine.PlayMode(rawValue: savedPlayMode) {
-                        engine.playMode = m
-                    }
-                    didSyncEngineFlags = true
-                }
+                // 引擎已在 init 里从 UserDefaults 恢复过设置，
+                // 这里只做一次双向校正：界面显示值以引擎当前值为准，
+                // 避免出现「开关显示开、引擎实际是关」的不一致。
+                ignoreRemoteStop = engine.ignoreRemoteStop
+                savedPlayMode = engine.playMode.rawValue
             }
             .alert("投屏网页地址", isPresented: $showAddressAlert) {
                 Button("好", role: .cancel) { }
