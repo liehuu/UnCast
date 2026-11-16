@@ -16,6 +16,21 @@ struct PlayerView: View {
     @State private var hideTask: Task<Void, Never>?
 
     var body: some View {
+        // onTapGesture 在 tvOS 上要求 16.0+（Siri Remote 的点击映射为 tap 是 16 才开放的）。
+        // 部署目标 15.0，因此做可用性分支：16+ 支持点击切换控制层，
+        // 15 回退为仅靠 Play/Pause、Menu、左右滑动操作（这三者在 15 上均可用）。
+        if #available(tvOS 16.0, *) {
+            playerLayer
+                .onTapGesture {
+                    withAnimation { showControls.toggle() }
+                    if showControls { scheduleHide() }
+                }
+        } else {
+            playerLayer
+        }
+    }
+
+    private var playerLayer: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
@@ -78,10 +93,6 @@ struct PlayerView: View {
             } else {
                 engine.stop()
             }
-        }
-        .onTapGesture {
-            withAnimation { showControls.toggle() }
-            if showControls { scheduleHide() }
         }
     }
 
