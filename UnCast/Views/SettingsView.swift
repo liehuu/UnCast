@@ -9,8 +9,10 @@ struct SettingsView: View {
 
     @AppStorage("uncast.device.name") private var deviceName = "UnCast (Apple TV)"
     @AppStorage("uncast.playmode") private var savedPlayMode = PlaybackEngine.PlayMode.repeatAll.rawValue
+    @AppStorage("uncast.ignoreRemoteStop") private var ignoreRemoteStop = true
 
     @State private var showAddressAlert = false
+    @State private var didSyncEngineFlags = false
 
     var body: some View {
         NavigationView {
@@ -66,8 +68,22 @@ struct SettingsView: View {
                             Image(systemName: engine.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                         }
                     }
+
+                    Toggle(isOn: $ignoreRemoteStop) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("手机退出后继续播放")
+                            Text("忽略手机端发来的停止指令，适合手机走开、电视继续放的场景")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .onChange(of: ignoreRemoteStop) { newValue in
+                        engine.ignoreRemoteStop = newValue
+                    }
                 } header: {
                     Text("播放")
+                } footer: {
+                    Text("DLNA 投屏时电视直接从源站拉流，手机只负责下指令。因此锁屏、切后台、退出 App 都不影响播放——除非客户端主动发停止指令。打开上面开关可忽略这类指令。")
                 }
 
                 // MARK: 服务
@@ -121,6 +137,16 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("设置")
+            .onAppear {
+                // 把持久化设置同步到引擎（只做一次，避免覆盖运行时修改）
+                if !didSyncEngineFlags {
+                    engine.ignoreRemoteStop = ignoreRemoteStop
+                    if let m = PlaybackEngine.PlayMode(rawValue: savedPlayMode) {
+                        engine.playMode = m
+                    }
+                    didSyncEngineFlags = true
+                }
+            }
             .alert("投屏网页地址", isPresented: $showAddressAlert) {
                 Button("好", role: .cancel) { }
             } message: {
