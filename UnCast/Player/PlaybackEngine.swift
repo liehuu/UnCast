@@ -60,28 +60,82 @@ final class PlaybackEngine: ObservableObject {
     }
     @Published var playMode: PlayMode = .normal
 
+    /// 忽略来自手机端的 Stop 指令。
+    ///
+    /// 为什么需要这个开关：部分 DLNA 客户端（尤其国产视频 App）在退出播放页
+    /// 或切后台时会主动发 AVTransport Stop。这在用户只想「手机走开、电视继续放」
+    /// 时会造成误停。开启后本机忽略 Stop，只在用户用遥控器停止时才真停。
+    @Published var ignoreRemoteStop = true
+
+    /// 记录最近一次 Stop 是否来自远端（供界面/日志区分）
+    private(set) var lastStopWasRemote = false
+    /// 累计被忽略的远端 Stop 次数，界面可展示「已保护 N 次」
+    private(set) var ignoredRemoteStopCount = 0
+
     // MARK: - 内部
 
     private let player = AVPlayer()
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
     private var itemStatusObservation: NSKeyValueObservation?
+    private var interruptionObserver: NSObjectProtocol?
     private var cancellables = Set<AnyCancellable>()
+
+    /// 被系统中断（来电/音频抢占/切后台）前的播放意图，用于恢复
+    private var shouldResumeAfterInterruption = false
 
     var avPlayer: AVPlayer { player }
 
     init() {
         configureAudioSession()
         setupObservers()
+        setupLifecycleHandling()
     }
 
     private func configureAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .moviePlayback)
+            // .playback + moviePlayback：允许在锁屏/后台持续出声
+            try session.setCategory(.playback, mode: .moviePlayback, options: [])
             try session.setActive(true)
         } catch {
-            // tvOS 上失败通常不影响播放，忽略
+            // tvOS 上失败通常不影响前台播放
+        }
+    }
+
+    /// 音频中断与 App 生命周期处理。
+    ///
+    /// DLNA 场景的关键要求：手机退出不该影响电视。这里的处理覆盖两类打断：
+    /// 1. AVAudioSession 中断（系统级音频抢占）：记录意图，结束后自动续播
+    /// 2. App 短暂失焦：不主动暂停；若被系统暂停则在回前台时恢复
+    private func setupLifecycleHandling() {
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+
+            switch type {
+            case .began:
+                // 中断开始：记住原本是否在放，但不改 state（避免 UI 闪成暂停）
+                self.shouldResumeAfterInterruption = (self.state == .playing)
+            case .ended:
+                guard self.shouldResumeAfterInterruption else { return }
+                // 中断结束自动续播，无需用户干预
+                do {
+                    try AVAudioSession.sharedInstance().setActive(true)
+                } catch { /* 忽略 */ }
+                if self.currentItem != nil {
+                    self.player.play()
+                    self.state = .playing
+                }
+                self.shouldResumeAfterInterruption = false
+            @unknown default:
+                break
+            }
         }
     }
 
@@ -122,6 +176,19 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func stop() {
+        stop(isRemote: false)
+    }
+
+    /// 停止播放。
+    /// - Parameter isRemote: true 表示来自手机的 DLNA Stop 指令。
+    ///   当 ignoreRemoteStop 开启时，远端 Stop 会被忽略——
+    ///   这是「手机走开、电视继续放」的关键：国产视频 App 退出播放页时常发 Stop。
+    func stop(isRemote: Bool) {
+        if isRemote && ignoreRemoteStop {
+            lastStopWasRemote = true
+            ignoredRemoteStopCount += 1
+            return
+        }
         player.pause()
         player.replaceCurrentItem(with: nil)
         state = .stopped
@@ -201,7 +268,11 @@ final class PlaybackEngine: ObservableObject {
             AVURLAssetPreferPreciseDurationAndTimingKey: true
         ])
         let playerItem = AVPlayerItem(asset: asset)
-        playerItem.preferredForwardBufferDuration = 5
+        // 较大前向缓冲：手机端退出/网络抖动时靠缓冲续播，不容易断流
+        playerItem.preferredForwardBufferDuration = 30
+        // 允许自动等待缓冲而不是直接报错，配合下面的自动恢复
+        playerItem.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        player.automaticallyWaitsToMinimizeStalling = true
 
         // 观测当前 item 状态
         itemStatusObservation = playerItem.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -217,6 +288,8 @@ final class PlaybackEngine: ObservableObject {
                 case .failed:
                     self.errorMessage = errDesc
                     self.state = .stopped
+                    // 网络类错误自动重试一次：手机退出可能引发短暂断网
+                    self.scheduleRetryIfTransient(item.error)
                 default:
                     break
                 }
@@ -235,6 +308,30 @@ final class PlaybackEngine: ObservableObject {
         player.replaceCurrentItem(with: playerItem)
         player.play()
         state = .playing
+    }
+
+    /// 网络类瞬时错误的重试。只重试一次，避免无限循环掩盖真实问题。
+    /// 触发场景：手机退出导致 WiFi 短暂抖动、源站短时限流。
+    private var retriedIndex: Int?
+
+    private func scheduleRetryIfTransient(_ error: Error?) {
+        guard let ns = error as NSError?, Self.isTransient(ns) else { return }
+        // 同一集只自动重试一次
+        guard retriedIndex != currentIndex else { return }
+        retriedIndex = currentIndex
+
+        let idx = currentIndex
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self, self.playlist.indices.contains(idx) else { return }
+            // 仅当用户没有主动停止、且仍停留在这一集时才重试
+            guard self.currentItem != nil, self.currentIndex == idx else { return }
+            self.loadAndPlay(index: idx)
+        }
+    }
+
+    private static func isTransient(_ error: NSError) -> Bool {
+        // -1001 超时 / -1005 连接中断 / -1009 无网络 / -1004 连不上主机
+        return [-1001, -1005, -1009, -1004].contains(error.code)
     }
 
     private func handlePlaybackEnd() {
