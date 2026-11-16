@@ -1,11 +1,17 @@
 name: Build UnCast tipa
 
+# 同一分支只保留一个运行，避免 macOS runner 配额被并发打满
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   push:
     branches: [ main, master ]
     paths:
       - 'UnCast/**'
       - '.github/workflows/build.yml'
+      - 'project.yml'
   workflow_dispatch:
     inputs:
       mode:
