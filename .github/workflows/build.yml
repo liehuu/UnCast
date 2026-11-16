@@ -26,17 +26,27 @@ on:
 jobs:
   build:
     name: Build tvOS App
-    runs-on: macos-14
+    # 注意：macos-14 当前无法分配 runner（job 0 秒被 cancelled），
+    # 用 macos-15（Xcode 16.x，含 tvOS 18 SDK，向下兼容 tvOS 15 部署目标）
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Xcode version
+      - name: Show Xcode version and tvOS SDK
         run: |
           xcodebuild -version
-          xcodebuild -showsdks | grep -i tvos || true
+          echo '---- available SDKs ----'
+          xcodebuild -showsdks || true
+          echo '---- tvOS SDK check ----'
+          if xcodebuild -showsdks | grep -qi 'appletvos'; then
+            echo 'OK: tvOS SDK present'
+            xcodebuild -showsdks | grep -i 'appletvos' || true
+          else
+            echo 'WARN: no tvOS SDK reported by -showsdks'
+          fi
 
       - name: Install XcodeGen
         run: |
