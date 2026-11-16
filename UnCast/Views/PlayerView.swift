@@ -111,6 +111,14 @@ struct PlayerView: View {
                         .padding(.vertical, 6)
                         .background(Color.white.opacity(0.14), in: Capsule())
                 }
+                if engine.ignoreRemoteStop && engine.ignoredRemoteStopCount > 0 {
+                    Label("已保护 \(engine.ignoredRemoteStopCount) 次", systemImage: "shield.checkered")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(.green.opacity(0.85))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.green.opacity(0.14), in: Capsule())
+                }
             }
             .padding(.horizontal, 70)
             .padding(.top, 50)
