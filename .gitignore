@@ -1,0 +1,9 @@
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+Payload/
+*.tipa
+verify/
+build.log
