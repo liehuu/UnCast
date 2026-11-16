@@ -1,0 +1,51 @@
+name: UnCast
+options:
+  bundleIdPrefix: com.uncast
+  deploymentTarget:
+    tvOS: "15.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "3"
+    SWIFT_OPTIMIZATION_LEVEL: "-O"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+
+targets:
+  UnCast:
+    type: application
+    platform: tvOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: UnCast
+        excludes:
+          - "App/Info.plist"
+          - "App/UnCast.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.uncast.tv
+        PRODUCT_NAME: UnCast
+        INFOPLIST_FILE: UnCast/App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: UnCast/App/UnCast.entitlements
+        GENERATE_INFOPLIST_FILE: "NO"
+        ENABLE_BITCODE: "NO"
+        # 完全关闭签名：CI 出未加密包，TrollStore 侧自行签名
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+        DEVELOPMENT_TEAM: ""
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
+
+schemes:
+  UnCast:
+    build:
+      targets:
+        UnCast: all
+    run:
+      config: Debug
+    archive:
+      config: Release
