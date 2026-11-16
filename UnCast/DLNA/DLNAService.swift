@@ -459,7 +459,7 @@ final class DLNAService: ObservableObject {
         let modeString = params["mode"] ?? "none"
         let mode: PlaybackEngine.PlayMode = (modeString == "playList") ? .repeatAll : .normal
 
-        onMainSync { [weak self] () -> Bool in
+        _ = onMainSync { [weak self] () -> Bool in
             guard let self else { return false }
             self.castCount += 1
             self.engine.castPlaylist(items, mode: mode, startAt: 0)
