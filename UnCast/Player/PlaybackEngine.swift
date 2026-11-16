@@ -87,6 +87,17 @@ final class PlaybackEngine: ObservableObject {
     var avPlayer: AVPlayer { player }
 
     init() {
+        // 先从持久化设置恢复「忽略远端 Stop」。
+        // 不能只依赖 SettingsView.onAppear 同步：用户关掉开关后重启 App，
+        // 在打开设置页之前引擎仍会用默认 true，开关等于失效。
+        if UserDefaults.standard.object(forKey: "uncast.ignoreRemoteStop") != nil {
+            ignoreRemoteStop = UserDefaults.standard.bool(forKey: "uncast.ignoreRemoteStop")
+        }
+        if let raw = UserDefaults.standard.string(forKey: "uncast.playmode"),
+           let m = PlayMode(rawValue: raw) {
+            playMode = m
+        }
+
         configureAudioSession()
         setupObservers()
         setupLifecycleHandling()
