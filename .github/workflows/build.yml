@@ -1,0 +1,137 @@
+name: Build UnCast tipa
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'UnCast/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '打包模式'
+        required: true
+        default: 'unsigned'
+        type: choice
+        options:
+          - unsigned
+          - trollstore
+
+jobs:
+  build:
+    name: Build tvOS App
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i tvos || true
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: UnCast
+        run: |
+          xcodegen generate --spec project.yml
+          ls -la
+          ls -la UnCast.xcodeproj
+
+      - name: Build archive (unsigned)
+        working-directory: UnCast
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project UnCast.xcodeproj \
+            -scheme UnCast \
+            -configuration Release \
+            -sdk appletvos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS="arm64" \
+            VALIDATE_PRODUCT=NO \
+            build 2>&1 | tee build.log
+
+          echo "---- build result ----"
+          grep -E "BUILD (SUCCEEDED|FAILED)" build.log | tail -5
+
+      - name: Locate .app bundle
+        id: find_app
+        working-directory: UnCast
+        run: |
+          APP_PATH=$(find build -name "UnCast.app" -type d -maxdepth 6 | head -1)
+          echo "Found app at: $APP_PATH"
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ .app not found, listing build dir:"
+            find build -maxdepth 4 -type d | head -50
+            exit 1
+          fi
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
+
+      - name: Package unsigned tipa
+        working-directory: UnCast
+        run: |
+          set -e
+          APP_PATH="${{ steps.find_app.outputs.app_path }}"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          echo "---- Payload content ----"
+          ls -la Payload
+          ls -la Payload/UnCast.app
+
+          # 清理签名残留（未签名包里不应有 _CodeSignature）
+          rm -rf Payload/UnCast.app/_CodeSignature || true
+          rm -f Payload/UnCast.app/embedded.mobileprovision || true
+
+          # tipa 就是 zip，扩展名不同而已
+          zip -qry UnCast.tipa Payload
+          ls -lh UnCast.tipa
+
+      - name: Verify tipa integrity
+        working-directory: UnCast
+        run: |
+          set -e
+          echo "---- tipa 内容清单 ----"
+          unzip -l UnCast.tipa | head -30
+          echo ""
+          echo "---- 关键文件校验 ----"
+          unzip -l UnCast.tipa | grep -E "Info.plist|UnCast$" || true
+
+          # 解回来比对，确认没坏
+          mkdir -p verify && cd verify && unzip -q ../UnCast.tipa
+          if [ -f "Payload/UnCast.app/Info.plist" ]; then
+            echo "✅ Info.plist 存在"
+            /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" Payload/UnCast.app/Info.plist
+            /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Payload/UnCast.app/Info.plist
+          else
+            echo "❌ Info.plist 缺失"
+            exit 1
+          fi
+
+          echo "---- 架构校验 ----"
+          lipo -info Payload/UnCast.app/UnCast || file Payload/UnCast.app/UnCast
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UnCast-tipa
+          path: UnCast/UnCast.tipa
+          retention-days: 30
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            UnCast/build.log
+          retention-days: 7
