@@ -53,6 +53,15 @@ jobs:
           brew install xcodegen
           xcodegen --version
 
+      - name: Install ldid (用于嵌入 entitlements 的 ad-hoc 签名)
+        run: |
+          # 关键：单纯 CODE_SIGNING_ALLOWED=NO 产出的二进制里**没有** entitlements，
+          # 装到 tvOS 后 IP_ADD_MEMBERSHIP 会 EPERM，SSDP 收不到 M-SEARCH。
+          # ldid -S 会做 ad-hoc 签名（不加密、不触发 FairPlay），
+          # 并把 entitlements 写进 __TEXT,__entitlements 与 LC_CODE_SIGNATURE。
+          brew install ldid || true
+          which ldid && ldid --version || echo "ldid 不可用，将回退到 codesign --sign -"
+
       - name: Generate Xcode project
         run: |
           set -e
@@ -106,10 +115,41 @@ jobs:
           ls -la Payload
           ls -la Payload/UnCast.app
 
-          # 清理签名残留（未签名包里不应有 _CodeSignature）
+          # 清理构建阶段可能的签名残留（未签名包不应有 _CodeSignature）
           rm -rf Payload/UnCast.app/_CodeSignature || true
           rm -f Payload/UnCast.app/embedded.mobileprovision || true
 
+      - name: Ad-hoc sign with entitlements (multicast)
+        run: |
+          set -e
+          BIN="Payload/UnCast.app/UnCast"
+          ENT="UnCast/App/UnCast.entitlements"
+
+          echo "---- entitlements 源文件 ----"
+          cat "$ENT"
+
+          if command -v ldid >/dev/null 2>&1; then
+            echo "---- 用 ldid -S 做 ad-hoc 签名并嵌入 entitlements ----"
+            ldid -S"$ENT" "$BIN"
+          else
+            # 回退：codesign ad-hoc 同样能嵌入 entitlements，且不加密
+            echo "---- ldid 不可用，改用 codesign --sign - ----"
+            codesign --force --sign - \
+              --entitlements "$ENT" \
+              --timestamp=none \
+              "$BIN"
+          fi
+
+          echo "---- 签名后校验 ----"
+          codesign -d --entitlements - "$BIN" 2>&1 | head -40 || true
+          echo "---- 确认 cryptid 仍为 0（未加密）----"
+          otool -l "$BIN" | grep -A4 LC_ENCRYPTION_INFO || echo "no encryption info"
+          echo "---- 确认有 LC_CODE_SIGNATURE ----"
+          otool -l "$BIN" | grep -A3 LC_CODE_SIGNATURE || true
+
+      - name: Package tipa (after signing)
+        run: |
+          set -e
           # tipa 就是 zip，扩展名不同而已
           zip -qry UnCast.tipa Payload
           ls -lh UnCast.tipa
@@ -139,11 +179,39 @@ jobs:
           echo "---- 架构校验 ----"
           lipo -info Payload/UnCast.app/UnCast || file Payload/UnCast.app/UnCast
 
-          echo "---- 确认未加密（无 CodeResources）----"
-          if [ -f "Payload/UnCast.app/_CodeSignature/CodeResources" ]; then
-            echo "⚠️ 仍存在签名残留"
+          echo "---- 确认未加密（cryptid 必须为 0）----"
+          ENC=$(otool -l Payload/UnCast.app/UnCast | grep -A4 LC_ENCRYPTION_INFO_64 | grep cryptid | awk '{print $2}' | head -1)
+          if [ -z "$ENC" ]; then
+            ENC=$(otool -l Payload/UnCast.app/UnCast | grep -A4 LC_ENCRYPTION_INFO | grep cryptid | awk '{print $2}' | head -1)
+          fi
+          echo "cryptid=${ENC:-none}"
+          if [ -n "$ENC" ] && [ "$ENC" != "0" ]; then
+            echo "❌ 包被加密（cryptid=$ENC），装到设备会崩溃"
+            exit 1
+          fi
+          echo "✅ 未加密"
+
+          echo "---- 确认 entitlements 已嵌入（组播必需）----"
+          ENT_OUT=$(codesign -d --entitlements - Payload/UnCast.app/UnCast 2>&1 || true)
+          echo "$ENT_OUT"
+          if echo "$ENT_OUT" | grep -q "com.apple.developer.networking.multicast"; then
+            echo "✅ com.apple.developer.networking.multicast 已嵌入"
           else
-            echo "✅ 无签名残留，可用于 TrollStore"
+            echo "❌ 缺少多播 entitlement → 装到 tvOS 上 SSDP 会 EPERM，手机搜不到设备"
+            exit 1
+          fi
+          if echo "$ENT_OUT" | grep -q "com.apple.security.network.server"; then
+            echo "✅ com.apple.security.network.server 已嵌入"
+          else
+            echo "⚠️ 缺少 network.server"
+          fi
+
+          echo "---- 确认已签名（有 CodeResources 或 LC_CODE_SIGNATURE）----"
+          if otool -l Payload/UnCast.app/UnCast | grep -q LC_CODE_SIGNATURE; then
+            echo "✅ 存在 LC_CODE_SIGNATURE（ad-hoc 签名，未加密，TrollStore 可装）"
+          else
+            echo "❌ 无 LC_CODE_SIGNATURE"
+            exit 1
           fi
 
       - name: Upload artifact
