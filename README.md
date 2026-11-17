@@ -37,15 +37,15 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 
 | 项 | 值 |
 |---|---|
-| 大小 | 1,753,217 字节（1.67 MB） |
-| sha256 | `8068c3d4935e9af02d2bbc4a70521861e5af3e6b02237ed0843b79de50f725a5` |
+| 大小 | 3,656,898 字节（3.49 MB） |
+| sha256 | `53754a0c2af1cbc0343065b63fc30803bdece03449c82f17a3360f02c8162f54` |
 | 架构 | arm64 |
 | 平台 | tvOS（`LC_BUILD_VERSION.platform = 3`，minos 15.0） |
 | 加密 | 未加密（`cryptid = 0`） |
 | 签名 | ad-hoc（含 `LC_CODE_SIGNATURE`，dataSize > 0） |
 | 多播权限 | `com.apple.developer.networking.multicast = true` |
-| 主屏图标 | 内置（`Assets.car` 1.46 MB，含 `App Icon` 三层 + `Top Shelf Image`） |
-| 构建 | GitHub Actions run #34（`d9432c8`），17 步全绿 |
+| 主屏图标 | 内置，橘黄渐变主题（`Assets.car` 3.17 MB，9 条 rendition） |
+| 构建 | GitHub Actions run #35（`3584da78`），17 步全绿 |
 
 下载：<https://github.com/liehuu/UnCast/releases/download/v1.0.0/UnCast-1.0.0.tipa>
 
@@ -53,10 +53,41 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 `python3 scripts/check_tipa.py <tipa>` 自行复现（16 项断言）。
 sha256 已通过「匿名下载回来再比对」验证，不是只信上传返回码。
 
+> 包体从 1.67 MB 涨到 3.49 MB，是因为图标从深色单调渐变改成了
+> 三色高饱和渐变加高光 —— 画面越复杂 PNG 压缩率越低。3.5 MB 对
+> TrollStore 安装没有影响，主屏显示也只会用其中最小的那档（400×240）。
+
 > **图标不需要你自己提供。** `scripts/make_icon.py` 用纯 Python（只依赖 numpy）
 > 按 tvOS 规范生成全部 13 张图：主屏图标三层的 @1x/@2x（400×240 / 800×480）、
 > App Store 图标 1280×768、Top Shelf 常规与宽屏的 @1x/@2x。
-> 想换配色或图形，改这个脚本里的几何参数重跑即可，不需要美术资源。
+
+#### 图标配色（内置四套，可一条命令切换）
+
+当前用的是 **lava 熔岩**（柠檬黄 → 橙 → 玫红）。配色集中在
+`make_icon.py` 的 `THEMES` 字典里，每套四个色位：渐变三段、外发光、字形渐变、边缘亮线。
+
+| 主题 | 观感 |
+|---|---|
+| `lava` | 柠檬黄 → 橙 → 玫红（**当前默认**） |
+| `aurora` | 青 → 靛紫 → 品红 |
+| `mint` | 青绿 → 湖蓝 → 宝蓝 |
+| `violet` | 品红 → 紫罗兰 → 电光蓝 |
+
+```bash
+python3 scripts/icon_themes_preview.py     # 先出四套对比图 dist/theme-preview.png
+python3 scripts/make_icon.py --theme mint  # 换成 mint
+python3 scripts/check_icon.py .            # 34 项校验
+```
+
+想完全自定义：改 `THEMES` 里某套的三个渐变色值即可（都是 0–1 的 RGB 浮点）。
+不需要美术资源，也不需要 Xcode。
+
+设计上三个容易踩的点（都已在代码注释里说明）：
+
+1. **发光要衬托轮廓，不能模糊轮廓** —— 外发光强度 0.24 / 半径 20px 是上限，
+   再大描边的锐利度就被糊掉了。
+2. **质感靠光，不靠纹理** —— 试过 45° 斜纹，在 1280×768 上是摩尔纹噪点，显脏。
+3. **字形要占满** —— 占画幅 56%×57%。低于 50% 在 tvOS 主屏的小格子里会显得空。
 
 ### TrollStore 安装步骤
 
@@ -267,6 +298,7 @@ tvOS 与 iOS 的格式不同：
 
 图标本身是用**纯 Python 手写 PNG 编码器**画的（只依赖 numpy），
 带解析式抗锯齿的 SDF 光晕，尺寸与不透明度全部通过断言校验。
+配色、主题切换与设计取舍见上文「图标配色」一节。
 
 ---
 
@@ -509,6 +541,7 @@ UnCast/
 ├── .github/workflows/build.yml    # CI：构建 + 三道门禁 + 出 tipa
 ├── scripts/
 │   ├── make_icon.py               # 生成全部 tvOS 图标/Top Shelf（纯 Python）
+│   ├── icon_themes_preview.py     # 四套配色对比图，换色先看图再决定
 │   ├── check_tipa.py              # 产物门禁：平台/加密/签名/多播权限
 │   ├── check_icon.py              # 图标门禁：源资源 + 包内 Assets.car
 │   ├── verify_player.py           # 播放器交互契约（36 项）
@@ -556,8 +589,9 @@ UnCast/
 | 转码服务（可选） | ⚠️ 按需 | 只有遇到 DTS / 部分 AC3 音频才需要，见「已知限制」 |
 | GitHub 账号 | ⚠️ 换人构建时需要 | 想自己出包就 fork 后 push，Actions 自动跑 |
 
-想改图标配色：编辑 `scripts/make_icon.py` 里的渐变与几何参数，重跑
-`python3 scripts/make_icon.py`，再跑 `python3 scripts/check_icon.py .` 确认。
+想改图标配色：`python3 scripts/icon_themes_preview.py` 先看四套效果，
+再 `python3 scripts/make_icon.py --theme <名字>` 切换，最后
+`python3 scripts/check_icon.py .` 确认。想完全自定义就改 `THEMES` 里的色值。
 
 ---
 
