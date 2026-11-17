@@ -241,6 +241,10 @@ jobs:
           # 上面 xcodebuild 成功、zip 成功都不能证明包可用；
           # 真正决定因素是字节里的平台/加密状态/多播权限。
           python3 --version
+          # 先用合成产物跑一遍门禁自身的回归（不需要 Xcode，秒级）。
+          # run #33 就是这里假 FAIL 的：图标真编进包多出 Assets.car，
+          # 而门禁用文件名黑名单猜可执行文件 → 候选数变 2 直接失败。
+          python3 scripts/selftest_tipa.py
           python3 scripts/check_tipa.py UnCast.tipa
 
       - name: Upload artifact

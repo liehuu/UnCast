@@ -91,20 +91,33 @@ def read_entitlements(data):
 
     if cs_off is None:
         return None
+    # 声明了 LC_CODE_SIGNATURE 但大小为 0（或越界的切片）不是"签名"。
+    # 不判这一条会 struct.error。而 struct.error 的退出码也是 1，
+    # 跟"检查不通过"撞了 —— 崩了和判不合格必须能分开。
+    if cs_size < 12 or cs_off + cs_size > len(data):
+        return None
 
     # SuperBlob 内部一律 big-endian
     if struct.unpack(">I", data[cs_off:cs_off + 4])[0] != CSMAGIC_EMBEDDED_SIGNATURE:
         return None
     count = struct.unpack(">I", data[cs_off + 8:cs_off + 12])[0]
+    if count == 0 or count > 64:
+        return None
     for i in range(count):
         e = cs_off + 12 + i * 8
+        if e + 8 > cs_off + cs_size:
+            return None
         btype = struct.unpack(">I", data[e:e + 4])[0]
         boff = struct.unpack(">I", data[e + 4:e + 8])[0]
         if btype == CSSLOT_ENTITLEMENTS:
             p = cs_off + boff
+            if p + 8 > len(data):
+                return None
             m = struct.unpack(">I", data[p:p + 4])[0]
             ln = struct.unpack(">I", data[p + 4:p + 8])[0]
             if m != CSMAGIC_EMBEDDED_ENTITLEMENTS:
+                return None
+            if ln < 8 or p + ln > len(data):
                 return None
             try:
                 return plistlib.loads(data[p + 8:p + ln])
@@ -138,6 +151,7 @@ def analyse_macho(data, gate, label):
     platform = None
     cryptid = None
     has_codesig = False
+    codesig_size = 0
     for _ in range(ncmds):
         if off + 8 > len(data):
             break
@@ -153,6 +167,7 @@ def analyse_macho(data, gate, label):
             cryptid = struct.unpack(endian + "I", data[off + 16:off + 20])[0]
         elif cmd == LC_CODE_SIGNATURE:
             has_codesig = True
+            codesig_size = struct.unpack(endian + "I", data[off + 12:off + 16])[0]
         off += cmdsize
 
     gate.check(f"{label}: 平台是 tvOS", platform == PLATFORM_TVOS,
@@ -160,7 +175,11 @@ def analyse_macho(data, gate, label):
     # cryptid None 表示没有加密命令 = 未加密，合法
     gate.check(f"{label}: 未 FairPlay 加密", cryptid in (None, 0),
                f"cryptid={cryptid}（非 0 装上会崩）")
-    gate.check(f"{label}: 已签名（有 LC_CODE_SIGNATURE）", has_codesig)
+    # 光有 LC_CODE_SIGNATURE 不算签名：dataSize 为 0 时签名区是空的，
+    # 等于没签名。只判"命令存在"会让这种包假通过。
+    gate.check(f"{label}: 已签名（有 LC_CODE_SIGNATURE 且非空）",
+               has_codesig and codesig_size > 0,
+               f"存在={has_codesig} dataSize={codesig_size}")
 
 
 def main(tipa_path):
@@ -181,31 +200,43 @@ def main(tipa_path):
     gate.check("含 Payload/UnCast.app/", any("Payload/UnCast.app/" in n for n in names))
     gate.check("含 Info.plist", any(n.endswith("UnCast.app/Info.plist") for n in names))
 
-    # 只在「文件」里找可执行文件：必须排除以 / 结尾的目录项，
-    # 否则 Payload/UnCast.app/ 本身也会被算作候选（曾经的假 FAIL 来源）。
-    file_names = [n for n in names if not n.endswith("/")]
-    exe_candidates = [
-        n for n in file_names
-        if n.count("/") == 2 and n.startswith("Payload/UnCast.app/")
-        and not n.endswith(".plist") and not n.endswith("PkgInfo")
-        and not n.endswith(".nib") and not n.endswith(".png")
-    ]
-    gate.check("含可执行文件", len(exe_candidates) == 1, f"候选={exe_candidates}")
-
-    if not exe_candidates:
+    # 可执行文件的路径**由 CFBundleExecutable 决定**，不靠文件名黑名单猜。
+    #
+    # 踩过的坑（CI run #33）：早先用「排除 .plist/.png/.nib/PkgInfo + 只允许 1 个候选」
+    # 来找可执行文件。图标修好之前包里只有 UnCast 一个文件，恰好成立；
+    # 图标真编进去之后多出 Assets.car，候选变 2 个 → 断言失败，
+    # 而且排第一的 Assets.car 被当 Mach-O 解析，magic 读出 0x534d4f42
+    # （= "CARC" 反序），报「不是 MH_MAGIC_64」。
+    # 产物是好的，判据是错的 —— 这类假 FAIL 比漏报更能把人带偏。
+    #
+    # 黑名单法本质上不可靠：包里以后多任何文件（.car/.metallib/.ttf/子目录资源）
+    # 都会让候选数漂移。Bundle 规范本来就规定了二进制名字的唯一权威来源。
+    plist_name = next((n for n in names if n.endswith("UnCast.app/Info.plist")), None)
+    if plist_name is None:
         return 0 if gate.result() else 1
 
-    exe_name = exe_candidates[0]
-
-    # ---- 2. Info.plist ----
     print("\n[2] Info.plist")
     try:
-        plist_name = [n for n in names if n.endswith("UnCast.app/Info.plist")][0]
         info = plistlib.loads(z.read(plist_name))
     except Exception as e:
         print(f"  [FAIL] Info.plist 解析失败: {e}")
         return 1
 
+    exe_base = info.get("CFBundleExecutable")
+    gate.check("CFBundleExecutable 存在", bool(exe_base), f"实际 {exe_base!r}")
+    if not exe_base:
+        return 0 if gate.result() else 1
+
+    exe_name = f"Payload/UnCast.app/{exe_base}"
+    # 必须排除以 / 结尾的目录项：同名的目录会让"存在"这条假通过
+    gate.check("含可执行文件（按 CFBundleExecutable 定位）",
+               exe_name in names and not exe_name.endswith("/"),
+               f"期望 {exe_name}")
+
+    if exe_name not in names:
+        return 0 if gate.result() else 1
+
+    # ---- 3. Info.plist 其余字段 ----
     gate.check("UIDeviceFamily 含 3（Apple TV）",
                3 in (info.get("UIDeviceFamily") or []),
                f"实际 {info.get('UIDeviceFamily')}")
@@ -218,16 +249,13 @@ def main(tipa_path):
     gate.check("CFBundleIdentifier 非空",
                bool(info.get("CFBundleIdentifier")),
                f"实际 {info.get('CFBundleIdentifier')}")
-    gate.check("CFBundleExecutable 与二进制名一致",
-               info.get("CFBundleExecutable") == exe_name.rsplit("/", 1)[-1],
-               f"plist={info.get('CFBundleExecutable')} 文件={exe_name}")
 
-    # ---- 3. Mach-O ----
+    # ---- 4. Mach-O ----
     print("\n[3] Mach-O 属性")
     data = z.read(exe_name)
     analyse_macho(data, gate, "binary")
 
-    # ---- 4. entitlements ----
+    # ---- 5. entitlements ----
     print("\n[4] 嵌入的 entitlements（组播必需）")
     ents = read_entitlements(data)
     if ents is None:
