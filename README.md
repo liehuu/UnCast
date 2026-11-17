@@ -37,21 +37,25 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 
 | 项 | 值 |
 |---|---|
-| 大小 | 3,656,898 字节（3.49 MB） |
-| sha256 | `53754a0c2af1cbc0343065b63fc30803bdece03449c82f17a3360f02c8162f54` |
+| 大小 | 3,664,105 字节（3.49 MB） |
+| sha256 | `a23a51206af40a921a7032be6faf48fc058d923894c54c49e61d742be96f47ca` |
 | 架构 | arm64 |
 | 平台 | tvOS（`LC_BUILD_VERSION.platform = 3`，minos 15.0） |
 | 加密 | 未加密（`cryptid = 0`） |
 | 签名 | ad-hoc（含 `LC_CODE_SIGNATURE`，dataSize > 0） |
 | 多播权限 | `com.apple.developer.networking.multicast = true` |
 | 主屏图标 | 内置，橘黄渐变主题（`Assets.car` 3.17 MB，9 条 rendition） |
-| 构建 | GitHub Actions run #35（`3584da78`），17 步全绿 |
+| 构建 | GitHub Actions run #37（`28c35beb`），17 步全绿 |
 
 下载：<https://github.com/liehuu/UnCast/releases/download/v1.0.0/UnCast-1.0.0.tipa>
 
 上述指标是读 tipa 内二进制的原始字节实测得出，可用
 `python3 scripts/check_tipa.py <tipa>` 自行复现（16 项断言）。
 sha256 已通过「匿名下载回来再比对」验证，不是只信上传返回码。
+
+> 包体从 1.67 MB 涨到 3.49 MB，是因为图标从深色单调渐变改成了
+> 三色高饱和渐变加高光 —— 画面越复杂 PNG 压缩率越低。3.5 MB 对
+> TrollStore 安装没有影响，主屏显示也只会用其中最小的那档（400×240）。
 
 > 包体从 1.67 MB 涨到 3.49 MB，是因为图标从深色单调渐变改成了
 > 三色高饱和渐变加高光 —— 画面越复杂 PNG 压缩率越低。3.5 MB 对
@@ -669,7 +673,7 @@ CI 里 `BUILD SUCCEEDED` 只是必要条件，不是充分条件。这个项目�
 
 | 门禁 | 检查对象 | 断言数 | 挡住的典型缺陷 |
 |---|---|---|---|
-| Gate 1 | 源码 + 图标源资源 | 36 + 34 + 17 + 12 | 方向键冲突、控制层唤不回、图标尺寸/透明度错、assert 永真 |
+| Gate 1 | 源码 + 图标源资源 | 36 + 34 + 17 + 12 + 37 + 17 | 方向键冲突、控制层唤不回、图标尺寸/透明度错、SSDP 报文不合规、assert 永真 |
 | Gate 2 | 编译产物 `Assets.car` | 11 | `ASSETCATALOG_COMPILER_APPICON_NAME` 漏配 → 图标不进包 |
 | Gate 3 | tipa 字节 | 16 + 20 | 平台不是 tvOS、被 FairPlay 加密、缺多播权限、空签名区 |
 
@@ -679,6 +683,47 @@ CI 里 `BUILD SUCCEEDED` 只是必要条件，不是充分条件。这个项目�
    写成字典时 `actool` 不报错、`Assets.car` 里有图，但主屏是白块（CI run #31）。
 2. **`Assets.car` 存在 ≠ 图标进包**。少写 `ASSETCATALOG_COMPILER_APPICON_NAME`
    时 car 照样生成，只是空的。
+
+### 怎么证明「修复真的进了包」
+
+门禁全绿只证明「源码符合契约」和「包能装」，**不证明修复在包里**。
+这两件事必须分开验证，否则会出现「门禁 37/37、设备上还是老行为」的假象。
+
+可靠做法是**差分两个产物**，而不是在单个包里找字符串：
+
+```python
+old = binary_of('dl35/UnCast.tipa')   # 修复前那次的产物
+new = binary_of('dl36/UnCast.tipa')   # 修复后那次的产物
+for sym in ['replyTargets', 'startNotifyLoop', 'bump', 'stMatches']:
+    # 新函数只应出现在新包里，被删的旧函数只应出现在旧包里
+    print(sym, old.count(sym.encode()), new.count(sym.encode()))
+```
+
+实测结果（run #35 → #36）：
+
+| 符号 / 字面量 | 旧包 | 新包 | 含义 |
+|---|---|---|---|
+| `replyTargets` | 0 | 2 | 新函数，仅在修复后 |
+| `startNotifyLoop` | 0 | 3 | 新函数，仅在修复后 |
+| `stMatches` | 1 | 0 | 被替换掉的旧函数 |
+| `Darwin/1.0 UPnP/1.1 UnCast/1.0` | 0 | 1 | 新 SERVER 串 |
+| `UPnP/1.0 DLNADOC/1.50` | 2 | 1 | 旧串，残留一处 → 见下 |
+
+#### 判据本身的两个坑（都真实踩过）
+
+1. **`count()` 是字面量匹配，不是正则**。我一度把 `rb'NOTIFY \* HTTP/1\.1'`
+   直接喂给 `count()`，转义符被当成真实字符，命中恒为 0 —— 于是「修复没进包」
+   的错误结论。要用 `re.search` 才写正则。
+2. **`<= 15 字节`不落 cstring 的猜想不成立**。Swift 有短字符串优化，
+   `M-SEARCH`（8 字节）、`239.255.255.250`（15 字节）确实查不到；
+   但 `upnp:rootdevice`（15 字节）却查到了 —— 有反例，猜想作废。
+   所以**不能**用「某个短字面量搜不到」推断「代码没编进去」。
+   可靠判据只有差分 + 符号名，符号名不会因字符串优化消失。
+
+上面表格最后一行（旧 SERVER 串 2 → 1 而非 0）就是靠差分查出来的真问题：
+改 SSDP 的 `serverString` 时漏了 `HTTPServer` 那处，导致同一版包里
+SSDP 自报 UPnP/1.1、HTTP 自报 UPnP/1.0 —— 严格客户端会当成两台设备。
+已修（HTTP 复用同一常量），并补了 3 条断言 + 1 条注入。
 
 ---
 
