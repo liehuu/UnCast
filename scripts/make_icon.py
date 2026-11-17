@@ -10,6 +10,18 @@
 绘制方式：有向距离场（SDF）在目标分辨率直接算覆盖率，
 抗锯齿来自 clip(0.5 - sdf, 0, 1)，不超采样、不引入模糊。
 
+## 设计要点（v2）
+
+v1 是深蓝底 + 单色白字形，在深色主屏上发灰。v2 三处改动：
+
+1. **背景**：三色高饱和对角渐变（不是两色深调），叠中心提亮、
+   左上玻璃高光、细微斜纹、弱暗角。饱和度靠渐变本身给，不靠提亮。
+2. **视差层（Middle）**：从"中心圆形柔光"改成"**字形外发光**"。
+   原来视差时看不出和字形的关系；现在外发光跟着字形走，前后错动时
+   像字形在发光。同时保留一层大范围主题柔光，保证覆盖面积达标。
+3. **字形（Front）**：加内侧边缘亮线 + 顶部高光 + 竖向同色系渐变，
+   不再是纯平白块。
+
 ## tvOS brandassets 的正确结构（写错的典型后果：图标变白块）
 
     Assets.xcassets/
@@ -25,6 +37,11 @@
         Top Shelf Image Wide.imageset/              ← 2320x720 @1x / 4640x1440 @2x
 
 Back 层与 Top Shelf 必须完全不透明，否则 tvOS 会拒收。
+
+用法:
+    python3 scripts/make_icon.py                # 用默认主题生成
+    python3 scripts/make_icon.py --theme lava   # 指定主题
+    python3 scripts/make_icon.py --list         # 列出所有主题
 """
 from __future__ import annotations
 
@@ -45,11 +62,48 @@ BRAND = os.path.join(ASSETS, BRAND_NAME + ".brandassets")
 # 设计基准画幅：所有几何按 min(w/1280, h/768) 等比缩放
 BASE_W, BASE_H = 1280, 768
 
-BG_TOP = (0.024, 0.035, 0.075)     # #060912
-BG_BOT = (0.075, 0.110, 0.255)     # #131C41
-ACCENT = (0.145, 0.435, 1.000)     # #256FF F
-GLYPH_TOP = (1.000, 1.000, 1.000)
-GLYPH_BOT = (0.839, 0.906, 1.000)  # #D6E7FF
+
+# ---------------------------------------------------------------- 主题配色
+
+# 每套主题四个色位：
+#   bg    三色对角渐变（暗→亮→饱和），决定整体鲜艳度
+#   glow  视差层的外发光与大柔光颜色（比 bg 亮，作为光）
+#   glyph 字形竖向渐变（上都接近白，下部带一点主题色，避免死白）
+#   edge  字形内侧边缘亮线的颜色（通常纯白或极浅）
+THEMES = {
+    "aurora": {
+        "label": "极光 Aurora（青 → 靛紫 → 品红）",
+        "bg": ((0.00, 0.70, 0.98), (0.36, 0.28, 1.00), (0.90, 0.14, 0.62)),
+        "glow": (0.62, 0.90, 1.00),
+        "glyph": ((1.00, 1.00, 1.00), (0.84, 0.93, 1.00)),
+        "edge": (1.00, 1.00, 1.00),
+    },
+    "lava": {
+        "label": "熔岩 Lava（柠檬黄 → 橙 → 玫红）",
+        "bg": ((1.00, 0.82, 0.02), (1.00, 0.42, 0.04), (0.94, 0.08, 0.34)),
+        "glow": (1.00, 0.82, 0.42),
+        "glyph": ((1.00, 1.00, 1.00), (1.00, 0.94, 0.84)),
+        "edge": (1.00, 0.99, 0.92),
+    },
+    "mint": {
+        "label": "薄荷 Mint（青绿 → 湖蓝 → 宝蓝）",
+        "bg": ((0.00, 0.94, 0.60), (0.00, 0.78, 0.96), (0.14, 0.34, 1.00)),
+        "glow": (0.52, 1.00, 0.88),
+        "glyph": ((1.00, 1.00, 1.00), (0.80, 1.00, 0.94)),
+        "edge": (0.94, 1.00, 0.99),
+    },
+    "violet": {
+        "label": "紫霞 Violet（品红 → 紫罗兰 → 电光蓝）",
+        "bg": ((1.00, 0.16, 0.60), (0.56, 0.18, 0.96), (0.18, 0.26, 1.00)),
+        "glow": (0.86, 0.58, 1.00),
+        "glyph": ((1.00, 1.00, 1.00), (0.93, 0.87, 1.00)),
+        "edge": (1.00, 0.97, 1.00),
+    },
+}
+
+# 默认主题。用户从四套预览里选了 lava（橘黄），故设为默认。
+# 想换回去：改这一行即可，资源随 CI 重新生成。
+DEFAULT_THEME = "lava"
 
 
 # ---------------------------------------------------------------- PNG 编码
@@ -151,92 +205,174 @@ def to_rgba(rgb, alpha, opaque: bool = False) -> np.ndarray:
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-# ---------------------------------------------------------------- 图层绘制
+def _lerp3(c0, c1, c2, t):
+    """三段渐变插值。t 为 HxW 的 0..1 数组。"""
+    a = np.array(c0, dtype=np.float32)
+    b = np.array(c1, dtype=np.float32)
+    c = np.array(c2, dtype=np.float32)
+    lo = t < 0.5
+    tt = np.where(lo, t * 2.0, (t - 0.5) * 2.0)
+    rgb_lo = a[None, None, :] + (b - a)[None, None, :] * tt[..., None]
+    rgb_hi = b[None, None, :] + (c - b)[None, None, :] * tt[..., None]
+    return np.where(lo[..., None], rgb_lo, rgb_hi)
+
+
+# ---------------------------------------------------------------- 字形几何
 
 def _scale_for(w: int, h: int, tweak: float = 1.0) -> float:
     return min(w / BASE_W, h / BASE_H) * tweak
 
 
-def draw_background(w: int, h: int) -> np.ndarray:
-    """底色层（不透明）：对角渐变 + 中心柔光 + 暗角。"""
-    px, py = _grid(w, h)
-    u, v = px / w, py / h
+def _glyph_sdf(px, py, w: int, h: int, tweak: float = 1.0):
+    """字形（圆角屏框 + 实心三角）的合并 SDF，内部为负。
 
-    t = np.clip(u * 0.55 + v * 0.45, 0.0, 1.0)
-    c0 = np.array(BG_TOP, dtype=np.float32)
-    c1 = np.array(BG_BOT, dtype=np.float32)
-    rgb = c0[None, None, :] + (c1 - c0)[None, None, :] * t[..., None]
+    合并用 np.minimum 而不是"各自 cover 后取 max"：
+    前者在并集边界处的距离场是连续的，抗锯齿只有一次；
+    后者会在两形状交叠处留下两道 0.5px 的硬边。
 
-    gx, gy = w * 0.5, h * 0.56
-    gr = min(w, h) * 0.66
-    d = np.sqrt((px - gx) ** 2 + (py - gy) ** 2) / gr
-    glow = np.clip(1.0 - d, 0.0, 1.0) ** 2.0
-    rgb = rgb + np.array(ACCENT, dtype=np.float32)[None, None, :] * (glow * 0.34)[..., None]
-
-    nx = (px / w - 0.5) * 2.0
-    ny = (py / h - 0.5) * 2.0
-    vig = 1.0 - 0.42 * np.clip(nx * nx + ny * ny, 0.0, 1.0)
-    rgb = rgb * vig[..., None]
-
-    return to_rgba(rgb, np.ones((h, w), dtype=np.float32), opaque=True)
-
-
-def draw_middle(w: int, h: int, tweak: float = 1.0) -> np.ndarray:
-    """光晕层（半透明）：视差时落在字形后方，营造深度。
-
-    注意：半径以 min(w,h) 为基准，**不能再乘缩放系数 s**。
-    min(w,h) 本身已随画幅线性变化，再乘一次 s 等于缩小两次——
-    400x240 上柔光会缩到只剩 2% 面积，视差看起来是平的。
+    尺寸（v2.1 放大）：v1 用 hw=296/hh=176，实测字形只占 48%×49%，
+    在 tvOS 主屏那种小格子里显得空。放大到 340/205 后约 55%×57%，
+    留白仍在（图标四周要透气），但视觉重量够了。
     """
-    px, py = _grid(w, h)
-    gx, gy = w * 0.5, h * 0.52
-    gr = min(w, h) * 0.40 * tweak
-    d = np.sqrt((px - gx) ** 2 + (py - gy) ** 2) / max(gr, 1e-6)
-    a = np.clip(1.0 - d, 0.0, 1.0) ** 2.4 * 0.34
-    rgb = np.ones((h, w, 3), dtype=np.float32) * np.array([0.62, 0.79, 1.0], dtype=np.float32)
-    return to_rgba(rgb, a)
-
-
-def draw_front(w: int, h: int, tweak: float = 1.0) -> np.ndarray:
-    """字形层（半透明）：AirPlay 造型——圆角屏框 + 底部实心三角。"""
-    px, py = _grid(w, h)
     s = _scale_for(w, h, tweak)
     cx, cy = w / 2.0, h / 2.0
 
-    hw, hh = 296.0 * s, 176.0 * s
-    radius = 40.0 * s
-    stroke = 26.0 * s
+    hw, hh = 340.0 * s, 205.0 * s
+    radius = 46.0 * s
+    stroke = 30.0 * s
 
-    sdf = rounded_rect_sdf(px, py, cx, cy, hw, hh, radius)
-    frame_cov = cover(np.abs(sdf) - stroke * 0.5)
+    frame = np.abs(rounded_rect_sdf(px, py, cx, cy, hw, hh, radius)) - stroke * 0.5
 
     # 三角：底边贴屏框内侧下缘并与描边连成一体，顶点朝上。
     # 底/高比按 AirPlay 官方标记取 ≈1.45；太窄会看成"山"。
     inner_bottom = cy + hh - stroke * 0.5
     base_y = inner_bottom + 2.0 * s
-    tri_h = 146.0 * s
+    tri_h = 168.0 * s
     half_base = tri_h / 2.0 * 1.45
     tri = [(cx - half_base, base_y),
            (cx + half_base, base_y),
            (cx, base_y - tri_h)]
-    tri_cov = cover(polygon_sdf(px, py, tri))
 
-    cov = np.maximum(frame_cov * 0.95, tri_cov)
+    return np.minimum(frame, polygon_sdf(px, py, tri)), s
 
-    # 竖向渐变：上纯白、下淡蓝，比纯白更有质感
+
+# ---------------------------------------------------------------- 图层绘制
+
+def draw_background(w: int, h: int, theme) -> np.ndarray:
+    """底色层（不透明）：三色对角渐变 + 中心提亮 + 玻璃高光 + 斜纹 + 弱暗角。"""
+    px, py = _grid(w, h)
+    u, v = px / w, py / h
+
+    # 135° 对角：左上偏暗色入口，右下最饱和
+    t = np.clip(u * 0.42 + v * 0.58, 0.0, 1.0)
+    rgb = _lerp3(*theme["bg"], t)
+
+    # 中心提亮：让中段色不至于和主屏背景糊在一起
+    gx, gy = w * 0.5, h * 0.44
+    gr = min(w, h) * 0.62
+    d = np.sqrt((px - gx) ** 2 + (py - gy) ** 2) / gr
+    lift = np.clip(1.0 - d, 0.0, 1.0) ** 2.0
+    rgb = rgb + (1.0 - rgb) * (lift * 0.26)[..., None]
+
+    # 左上玻璃高光：整块图标有"罩了一层玻璃"的质感
+    hx, hy = w * 0.24, h * 0.18
+    hr = max(w, h) * 0.58
+    dd = np.sqrt((px - hx) ** 2 + (py - hy) ** 2) / hr
+    spec = np.clip(1.0 - dd, 0.0, 1.0) ** 3.0 * 0.32
+    rgb = rgb + (1.0 - rgb) * spec[..., None]
+
+    # 斜纹（已停用）
+    #
+    # 试过给背景加 ±1.6% 的 45° 斜纹做质感，在 400x240 上没问题（那档本来就跳过），
+    # 但在 1280x768 的预览与 Top Shelf 上，15px 周期的斜线看起来是**摩尔纹噪点**，
+    # 不像材质，反而显脏。质感交给渐变与玻璃高光就够了。
+    #
+    # 保留这段说明而不是删干净：下次想加纹理时先看这里，别重犯。
+
+    # 弱暗角：v1 是 0.42，压得太狠导致整体发闷；0.24 只收边不压中心
+    nx = (px / w - 0.5) * 2.0
+    ny = (py / h - 0.5) * 2.0
+    vig = 1.0 - 0.24 * np.clip(nx * nx + ny * ny, 0.0, 1.0)
+    rgb = rgb * vig[..., None]
+
+    return to_rgba(rgb, np.ones((h, w), dtype=np.float32), opaque=True)
+
+
+def draw_middle(w: int, h: int, theme, tweak: float = 1.0) -> np.ndarray:
+    """视差光晕层（半透明）：**字形外发光** + 大范围主题柔光。
+
+    内部挖空是必须的：check_icon.py 断言 Middle 层的 max alpha 必须
+    < 200（否则会盖住 Front 的字形）。所以这里 alpha 全在字形**外面**，
+    内部恒为 0。
+
+    覆盖面积也要够（断言 > 20%）。单靠外发光不够——外扩一圈
+    在 400x240 上算下来只有 ~16%。所以下面再叠一层大半径柔光兜底。
+
+    强度与半径的取舍（v2.1）：初版用 0.42 / 34px，合成后字形描边的
+    锐利度被光晕盖住，整体发虚 —— 在 tvOS 主屏那种小尺寸上尤其明显。
+    发光应该"衬托"轮廓，不该"模糊"轮廓，所以降到 0.24 / 20px，
+    让光贴着字形边缘衰减，而不是摊成一大团。
+    """
+    px, py = _grid(w, h)
+    sdf, s = _glyph_sdf(px, py, w, h, tweak)
+
+    # 字形外发光：指数衰减，跟着字形轮廓走
+    #
+    # 注意 max(sdf, 0) 不能省：sdf 在字形内部是负数，
+    # 负数取 1.5 次幂会先算出 NaN（RuntimeWarning: invalid value in power），
+    # 再被 np.where 替换。结果虽然对，但 NaN 会污染上下文的浮点运算，
+    # 而且在 --warn error 下会直接把构建打断。
+    R = 20.0 * s
+    outward = np.maximum(sdf, 0.0)
+    halo = np.exp(-(outward / max(R, 1e-6)) ** 1.8) * 0.24
+    halo = np.where(sdf < 0.0, 0.0, halo)
+
+    # 大范围柔光：保证覆盖率，同时给外发光一个"环境光"底
+    gx, gy = w * 0.5, h * 0.50
+    gr = min(w, h) * 0.46
+    dd = np.sqrt((px - gx) ** 2 + (py - gy) ** 2) / max(gr, 1e-6)
+    soft = np.clip(1.0 - dd, 0.0, 1.0) ** 2.2 * 0.28
+
+    a = np.clip(halo + soft, 0.0, 0.55)
+    rgb = np.ones((h, w, 3), dtype=np.float32) * np.array(theme["glow"], dtype=np.float32)
+    return to_rgba(rgb, a)
+
+
+def draw_front(w: int, h: int, theme, tweak: float = 1.0) -> np.ndarray:
+    """字形层：竖向渐变 + 顶部高光 + 内侧边缘亮线。"""
+    px, py = _grid(w, h)
+    sdf, s = _glyph_sdf(px, py, w, h, tweak)
+    cov = cover(sdf)
+
+    cx, cy = w / 2.0, h / 2.0
+    hh = 176.0 * s
+
+    # 竖向渐变：上都接近白，下部带一点主题色
     g = np.clip((py - (cy - hh)) / max(1.0, 2.0 * hh), 0.0, 1.0)
-    top = np.array(GLYPH_TOP, dtype=np.float32)
-    bot = np.array(GLYPH_BOT, dtype=np.float32)
+    top = np.array(theme["glyph"][0], dtype=np.float32)
+    bot = np.array(theme["glyph"][1], dtype=np.float32)
     rgb = top[None, None, :] + (bot - top)[None, None, :] * g[..., None]
+
+    # 顶部高光：字形上缘更亮，有"受光"方向感。
+    # 用 py 上的线性衰减而不是径向，因为字形是横长条，径向会把两边压暗。
+    hl = np.clip(1.0 - (py - (cy - hh)) / max(1.0, 1.45 * hh), 0.0, 1.0) ** 2.0 * 0.42
+    rgb = rgb + (1.0 - rgb) * hl[..., None]
+
+    # 内侧边缘亮线：沿轮廓 2px 内提亮，让字形边缘"立"起来。
+    # 只在内部（sdf<0）生效，外部由 cover 截断。
+    ew = max(1.4 * s, 0.8)
+    edge = np.exp(-(np.abs(sdf) / ew) ** 2)
+    ed = np.array(theme["edge"], dtype=np.float32)
+    rgb = rgb + (ed[None, None, :] - rgb) * (edge * 0.55)[..., None]
 
     return to_rgba(rgb, cov)
 
 
-def flatten(w: int, h: int) -> np.ndarray:
+def flatten(w: int, h: int, theme) -> np.ndarray:
     """三层合成成单张（用于兜底 PNG 与预览）。"""
-    back = draw_background(w, h).astype(np.float32) / 255.0
-    mid = draw_middle(w, h).astype(np.float32) / 255.0
-    front = draw_front(w, h).astype(np.float32) / 255.0
+    back = draw_background(w, h, theme).astype(np.float32) / 255.0
+    mid = draw_middle(w, h, theme).astype(np.float32) / 255.0
+    front = draw_front(w, h, theme).astype(np.float32) / 255.0
 
     rgb = back[..., :3]
     a = back[..., 3]
@@ -286,7 +422,7 @@ def _write_layer(layer_dir: str, files) -> list[str]:
     return out
 
 
-def build_stack(stack_dir: str, sizes, tweak: float = 1.0) -> dict:
+def build_stack(stack_dir: str, sizes, theme, tweak: float = 1.0) -> dict:
     """三层视差图标栈。
 
     sizes: [(w, h, suffix), ...]
@@ -298,9 +434,9 @@ def build_stack(stack_dir: str, sizes, tweak: float = 1.0) -> dict:
     })
 
     painters = {
-        "Front": lambda w, h: draw_front(w, h, tweak),
-        "Middle": lambda w, h: draw_middle(w, h, tweak),
-        "Back": lambda w, h: draw_background(w, h),
+        "Front": lambda w, h: draw_front(w, h, theme, tweak),
+        "Middle": lambda w, h: draw_middle(w, h, theme, tweak),
+        "Back": lambda w, h: draw_background(w, h, theme),
     }
 
     report = {}
@@ -310,7 +446,7 @@ def build_stack(stack_dir: str, sizes, tweak: float = 1.0) -> dict:
     return report
 
 
-def build_imageset(path: str, sizes) -> list[str]:
+def build_imageset(path: str, sizes, theme) -> list[str]:
     """sizes: [(w, h, suffix, filename), ...]"""
     _dump(os.path.join(path, "Contents.json"), {
         "images": [{"filename": fn, "idiom": "tv", "scale": s.lstrip("@")}
@@ -319,13 +455,33 @@ def build_imageset(path: str, sizes) -> list[str]:
     })
     out = []
     for (w, h, suffix, fn) in sizes:
-        hh = write_png(os.path.join(path, fn), flatten(w, h))
+        hh = write_png(os.path.join(path, fn), flatten(w, h, theme))
         out.append(f"{fn} {hh[:12]}")
     return out
 
 
 def main():
+    argv = sys.argv[1:]
+
+    if "--list" in argv:
+        print("可用主题:")
+        for k, v in THEMES.items():
+            mark = " (默认)" if k == DEFAULT_THEME else ""
+            print(f"  {k:<10} {v['label']}{mark}")
+        return 0
+
+    theme_key = DEFAULT_THEME
+    if "--theme" in argv:
+        i = argv.index("--theme")
+        if i + 1 >= len(argv):
+            raise SystemExit("--theme 后需要主题名")
+        theme_key = argv[i + 1]
+    if theme_key not in THEMES:
+        raise SystemExit(f"未知主题 {theme_key}，可用: {', '.join(THEMES)}")
+
+    theme = THEMES[theme_key]
     print(f"资源根目录: {ASSETS}")
+    print(f"主题      : {theme_key} — {theme['label']}")
     _dump(os.path.join(ASSETS, "Contents.json"), {"info": _info()})
 
     _dump(os.path.join(BRAND, "Contents.json"), {
@@ -348,7 +504,7 @@ def main():
     print("\n== App Icon.imagestack (400x240 / 800x480) ==")
     for layer, lines in build_stack(
             os.path.join(BRAND, "App Icon.imagestack"),
-            [(400, 240, "@1x"), (800, 480, "@2x")]).items():
+            [(400, 240, "@1x"), (800, 480, "@2x")], theme).items():
         for ln in lines:
             print(f"   {ln}")
 
@@ -356,7 +512,7 @@ def main():
     print("\n== App Icon - App Store.imagestack (1280x768) ==")
     for layer, lines in build_stack(
             os.path.join(BRAND, "App Icon - App Store.imagestack"),
-            [(1280, 768, "@1x")]).items():
+            [(1280, 768, "@1x")], theme).items():
         for ln in lines:
             print(f"   {ln}")
 
@@ -364,13 +520,13 @@ def main():
     print("\n== Top Shelf Image (1920x720 / 3840x1440) ==")
     for ln in build_imageset(os.path.join(BRAND, "Top Shelf Image.imageset"),
                              [(1920, 720, "@1x", "top@1x.png"),
-                              (3840, 1440, "@2x", "top@2x.png")]):
+                              (3840, 1440, "@2x", "top@2x.png")], theme):
         print(f"   {ln}")
 
     print("\n== Top Shelf Image Wide (2320x720 / 4640x1440) ==")
     for ln in build_imageset(os.path.join(BRAND, "Top Shelf Image Wide.imageset"),
                              [(2320, 720, "@1x", "wide@1x.png"),
-                              (4640, 1440, "@2x", "wide@2x.png")]):
+                              (4640, 1440, "@2x", "wide@2x.png")], theme):
         print(f"   {ln}")
 
     # 单张 1280x768 合成图，随包分发。
@@ -379,14 +535,14 @@ def main():
     #   1. 给用户直接看的预览；
     #   2. Assets.car 缺失时，让 check_icon.py 能报出"图标渲染过但没编进包"。
     loose = os.path.join(ROOT, "UnCast", "App", "AppIcon.png")
-    hl = write_png(loose, flatten(1280, 768))
+    hl = write_png(loose, flatten(1280, 768, theme))
     print(f"\n参照图  : UnCast/App/AppIcon.png  {hl[:12]}")
 
     # 预览（不进包）
     preview_dir = os.path.join(ROOT, "dist")
     os.makedirs(preview_dir, exist_ok=True)
     prev = os.path.join(preview_dir, "icon-preview.png")
-    hp = write_png(prev, flatten(1280, 768))
+    hp = write_png(prev, flatten(1280, 768, theme))
     print(f"预览图  : {prev}")
     print(f"sha256  : {hp}")
 
@@ -403,6 +559,7 @@ def main():
             raise SystemExit("不透明层出现透明像素，tvOS 会拒收")
 
     print("\n图标资源生成完毕。")
+    return 0
 
 
 def _read_png(path: str) -> np.ndarray:
