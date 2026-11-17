@@ -224,7 +224,10 @@ final class HTTPServer {
         var headers = resp.headers
         headers["Content-Length"] = String(resp.body.count)
         headers["Connection"] = "close"
-        headers["Server"] = "UnCast/1.0 UPnP/1.0 DLNADOC/1.50"
+        // Server 头与 SSDP 的 SERVER 保持同一串。
+        // 两处不一致时，同一台设备在 SSDP 响应和 HTTP 响应里自报
+        // 不同的 UPnP 版本，严格实现的客户端会当成两台不同的设备。
+        headers["Server"] = SSDPResponder.serverString
         headers["Access-Control-Allow-Origin"] = "*"
         headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         headers["Access-Control-Allow-Headers"] = "*"

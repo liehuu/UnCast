@@ -267,10 +267,31 @@ def main() -> int:
     if os.path.isfile(SVC):
         svc = strip_comments(open(SVC, encoding="utf-8").read())
         c.check("DLNAService 不再重复发启动通告",
-                "responder.announceAlive()" not in svc,
+                "responder.announceLive()" not in svc
+                and "responder.announceAlive()" not in svc,
                 "两处都发会重复通告")
     else:
         c.check("DLNAService.swift 可读", False, "文件缺失")
+
+    # ── I. SERVER 串在 SSDP 与 HTTP 两处必须一致 ──
+    #
+    # 不一致的后果：同一台设备在 SSDP 响应里自报 UPnP/1.1、
+    # 在 HTTP 响应头里自报 UPnP/1.0，严格客户端会当成两台不同设备，
+    # 于是设备列表里出现两个条目、点哪个都连不上。
+    # 踩过：改 SSDP 的 serverString 时忘了 HTTP 那处，一版包里两串并存。
+    print("\n[I] SERVER 串两处一致")
+    http_src_path = os.path.join(os.path.dirname(SRC), "HTTPServer.swift")
+    if os.path.isfile(http_src_path):
+        http_src = strip_comments(open(http_src_path, encoding="utf-8").read())
+        c.check("HTTP 的 Server 头复用 SSDP 的同一常量",
+                "SSDPResponder.serverString" in http_src,
+                "HTTP 侧另有字面量，改一处会不一致")
+        # 反向：HTTP 里不应再有独立的 UPnP 版本字面量
+        leftover = re.findall(r'"UnCast/[\d.]+ UPnP/[\d.]+[^"]*"', http_src)
+        c.check("HTTP 侧无残留的独立 SERVER 字面量",
+                not leftover, f"残留 {leftover}")
+    else:
+        c.check("HTTPServer.swift 可读", False, "文件缺失")
 
     print()
     print("=" * 68)

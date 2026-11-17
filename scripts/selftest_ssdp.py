@@ -26,6 +26,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "UnCast", "DLNA", "SSDPResponder.swift")
 SVC = os.path.join(ROOT, "UnCast", "DLNA", "DLNAService.swift")
+HTTP = os.path.join(ROOT, "UnCast", "DLNA", "HTTPServer.swift")
 VERIFY = os.path.join(ROOT, "scripts", "verify_ssdp.py")
 PY = sys.executable
 
@@ -70,13 +71,14 @@ def patch(path: str, old: str, new: str, label: str,
 
 
 def main() -> int:
-    for p in (SRC, SVC):
+    for p in (SRC, SVC, HTTP):
         if not os.path.isfile(p):
             print(f"找不到 {p}")
             return 2
 
     shutil.copy2(SRC, SRC + ".orig")
     shutil.copy2(SVC, SVC + ".orig")
+    shutil.copy2(HTTP, HTTP + ".orig")
 
     rc, fails = run_verify()
     print(f"[基线] rc={rc}, fails={len(fails)}")
@@ -84,6 +86,7 @@ def main() -> int:
         print("基线不绿，无法做变异测试")
         shutil.move(SRC + ".orig", SRC)
         shutil.move(SVC + ".orig", SVC)
+        shutil.move(HTTP + ".orig", HTTP)
         return 1
 
     results: list = []
@@ -222,6 +225,14 @@ def main() -> int:
           "DLNAService 不再重复发启动通告",
           results)
 
+    # B9: HTTP 的 Server 头改回独立字面量（两处不一致 → 客户端当两台设备）
+    patch(HTTP,
+          'headers["Server"] = SSDPResponder.serverString',
+          'headers["Server"] = "UnCast/1.0 UPnP/1.0 DLNADOC/1.50"',
+          "B9 HTTP 的 Server 头另起字面量",
+          ("HTTP 的 Server 头复用", "HTTP 侧无残留"),
+          results)
+
     # ══════════════════════════════════════════════════════════
     print("\n== C. 合法变体不能被误杀 ==")
     # ══════════════════════════════════════════════════════════
@@ -261,6 +272,7 @@ def main() -> int:
     # 还原并复跑
     shutil.move(SRC + ".orig", SRC)
     shutil.move(SVC + ".orig", SVC)
+    shutil.move(HTTP + ".orig", HTTP)
     rc, fails = run_verify()
     print(f"\n[还原后复跑] rc={rc}, fails={len(fails)}")
     ok_all &= (rc == 0 and not fails)
