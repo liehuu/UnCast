@@ -54,6 +54,9 @@ OPAQUE = {
 
 BRAND_REL = "UnCast/Assets.xcassets/App Icon & Top Shelf Image.brandassets"
 
+# 仓库根：脚本在 <root>/scripts/ 下
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 
 # ------------------------------------------------------------------ PNG 读
 
@@ -223,17 +226,21 @@ def check_bundle(app: str, c: Checker):
     with open(plist_path, "rb") as f:
         info = plistlib.load(f)
 
+    # tvOS 与 iOS 的格式**不同**，这里必须按 tvOS 判：
+    #   tvOS → CFBundlePrimaryIcon 是字符串（资源目录里的图标栈名）
+    #   iOS  → CFBundlePrimaryIcon 是字典
+    # 写成 iOS 的字典形式时 tvOS 读不到，主屏是白块 —— 本项目真的踩过，
+    # 所以这条断言要明确拒绝 dict。
     icons = info.get("CFBundleIcons")
     c.check(isinstance(icons, dict), "Info.plist 有 CFBundleIcons")
     if isinstance(icons, dict):
-        primary = icons.get("CFBundlePrimaryIcon") or {}
-        c.check(isinstance(primary, dict), "CFBundlePrimaryIcon 存在")
-        if isinstance(primary, dict):
-            c.check(primary.get("CFBundleIconName") == "App Icon",
-                    "CFBundleIconName == 'App Icon'",
-                    repr(primary.get("CFBundleIconName")))
-            files = primary.get("CFBundleIconFiles") or []
-            c.check("AppIcon" in files, "CFBundleIconFiles 含 AppIcon", str(files))
+        primary = icons.get("CFBundlePrimaryIcon")
+        c.check(isinstance(primary, str),
+                "CFBundlePrimaryIcon 是字符串（tvOS 格式）",
+                f"实际类型 {type(primary).__name__}: {primary!r}")
+        if isinstance(primary, str):
+            c.check(primary == "App Icon",
+                    "CFBundlePrimaryIcon == 'App Icon'", repr(primary))
 
     shelf = info.get("TVTopShelfImage")
     c.check(isinstance(shelf, dict), "Info.plist 有 TVTopShelfImage")
@@ -244,6 +251,34 @@ def check_bundle(app: str, c: Checker):
         c.check(shelf.get("TVTopShelfPrimaryImageWide") == "Top Shelf Image Wide",
                 "TVTopShelfPrimaryImageWide 正确",
                 repr(shelf.get("TVTopShelfPrimaryImageWide")))
+
+
+def check_plist_shape(c: Checker):
+    """源 Info.plist 的结构检查（不需要 Xcode，本机可跑）。
+
+    这一层专门抓"格式写错但编译不报错"的问题：
+    CFBundlePrimaryIcon 写成 iOS 的字典形式时，xcodebuild 一样 SUCCEEDED，
+    actool 也不报错，但 tvOS 读不到，主屏是白块。
+    """
+    print("\n== 3. 源 Info.plist 图标键（tvOS 格式）==")
+    path = os.path.join(ROOT, "UnCast", "App", "Info.plist")
+    c.check(os.path.isfile(path), "源 Info.plist 存在")
+    if not os.path.isfile(path):
+        return
+    with open(path, "rb") as f:
+        info = plistlib.load(f)
+
+    icons = info.get("CFBundleIcons")
+    c.check(isinstance(icons, dict), "源 Info.plist 有 CFBundleIcons")
+    if isinstance(icons, dict):
+        primary = icons.get("CFBundlePrimaryIcon")
+        # 关键的反向断言：必须是字符串，不能是 dict
+        c.check(isinstance(primary, str),
+                "CFBundlePrimaryIcon 为字符串（tvOS 格式，非 iOS 字典）",
+                f"实际 {type(primary).__name__}: {primary!r}")
+
+    shelf = info.get("TVTopShelfImage")
+    c.check(isinstance(shelf, dict), "源 Info.plist 有 TVTopShelfImage")
 
 
 def main() -> int:
@@ -258,12 +293,13 @@ def main() -> int:
 
     if target.endswith(".app"):
         # 从 .app 反推仓库根，用于查源资源
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         check_sources(root, c)
+        check_plist_shape(c)
         check_bundle(target, c)
         title = "图标门禁"
     else:
         check_sources(target, c)
+        check_plist_shape(c)
         title = "图标源资源检查"
 
     return c.report(title)

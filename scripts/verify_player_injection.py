@@ -11,6 +11,10 @@ A. **回放历史缺陷**（最重要）
 B. **逐条破坏**
    针对每条断言做最小破坏，确认对应项变红。
 
+C. **图标 plist 格式**（check_icon.py 的变异）
+   tvOS 的 CFBundlePrimaryIcon 必须是字符串，写成 iOS 的字典形式
+   编译照样成功、actool 也不报错，但主屏白块 —— CI run #31 真栽过。
+
 每次注入后必须还原，最后复跑确认回到全绿。
 """
 from __future__ import annotations
@@ -199,9 +203,49 @@ def main() -> int:
     print(f"\n[还原后复跑] rc={rc}, fails={len(fails)}")
     ok &= (rc == 0 and len(fails) == 0)
 
+    # ── C. 图标 plist 格式（真实踩过的坑）
+    ok &= check_plist_shape()
+
     print("\n结论:", "契约校验有效（能红能绿，且抓住历史缺陷）"
           if ok else "存在永真断言，必须修")
     return 0 if ok else 1
+
+
+def check_plist_shape() -> bool:
+    """tvOS 的 CFBundlePrimaryIcon 必须是字符串。
+    写成 iOS 的字典形式时构建全绿但主屏白块 —— CI run #31 的真实失败原因。"""
+    print("\n== C. 图标 plist 格式（iOS 字典 vs tvOS 字符串）==")
+    plist = "UnCast/App/Info.plist"
+    if not os.path.isfile(plist):
+        print("[FAIL] 找不到 Info.plist")
+        return False
+
+    import plistlib
+    shutil.copy2(plist, plist + ".orig")
+
+    def icon_rc():
+        r = subprocess.run([PY, "scripts/check_icon.py", "."],
+                           capture_output=True, text=True)
+        return r.returncode
+
+    try:
+        base = icon_rc()
+        info = plistlib.load(open(plist, "rb"))
+        info["CFBundleIcons"]["CFBundlePrimaryIcon"] = {
+            "CFBundleIconName": "App Icon",
+            "CFBundleIconFiles": ["AppIcon"],
+        }
+        with open(plist, "wb") as f:
+            plistlib.dump(info, f)
+        injected = icon_rc()
+    finally:
+        shutil.move(plist + ".orig", plist)
+
+    restored = icon_rc()
+    hit = base == 0 and injected != 0 and restored == 0
+    print(f"[{'PASS' if hit else 'FAIL'}] iOS 字典形式被拒绝  "
+          f"(基线 rc={base}, 注入 rc={injected}, 还原 rc={restored})")
+    return hit
 
 
 if __name__ == "__main__":

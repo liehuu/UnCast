@@ -32,18 +32,15 @@
 	<array>
 		<integer>3</integer>
 	</array>
-	<!-- tvOS 主屏图标：必须显式声明，否则即使 Assets.car 里有图也显示白块 -->
+	<!-- tvOS 主屏图标：必须显式声明，否则即使 Assets.car 里有图也显示白块。
+	     tvOS 与 iOS 的格式**不同**：
+	       iOS  → CFBundlePrimaryIcon 是字典（含 CFBundleIconName / CFBundleIconFiles）
+	       tvOS → CFBundlePrimaryIcon 是**字符串**，值是资源目录里的图标栈名
+	     写成 iOS 的字典形式，tvOS 读不到，主屏依旧白块（本项目踩过）。 -->
 	<key>CFBundleIcons</key>
 	<dict>
 		<key>CFBundlePrimaryIcon</key>
-		<dict>
-			<key>CFBundleIconName</key>
-			<string>App Icon</string>
-			<key>CFBundleIconFiles</key>
-			<array>
-				<string>AppIcon</string>
-			</array>
-		</dict>
+		<string>App Icon</string>
 	</dict>
 	<!-- 主屏顶部推荐位大图 -->
 	<key>TVTopShelfImage</key>

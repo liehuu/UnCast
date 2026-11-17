@@ -373,10 +373,14 @@ def main():
                               (4640, 1440, "@2x", "wide@2x.png")]):
         print(f"   {ln}")
 
-    # 兜底散装 PNG：万一 actool 产物没被 SpringBoard 认，还有一份可读图
+    # 单张 1280x768 合成图，随包分发。
+    # 注意：tvOS **不**通过这张图显示主屏图标（tvOS 的 CFBundlePrimaryIcon
+    # 是字符串，指向 Assets.car 里的图标栈）。它只用于两件事：
+    #   1. 给用户直接看的预览；
+    #   2. Assets.car 缺失时，让 check_icon.py 能报出"图标渲染过但没编进包"。
     loose = os.path.join(ROOT, "UnCast", "App", "AppIcon.png")
     hl = write_png(loose, flatten(1280, 768))
-    print(f"\n兜底 PNG: UnCast/App/AppIcon.png  {hl[:12]}")
+    print(f"\n参照图  : UnCast/App/AppIcon.png  {hl[:12]}")
 
     # 预览（不进包）
     preview_dir = os.path.join(ROOT, "dist")

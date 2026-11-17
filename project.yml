@@ -25,7 +25,8 @@ targets:
         excludes:
           - "App/Info.plist"
           - "App/UnCast.entitlements"
-          # AppIcon.png 保留进 bundle，作为 CFBundleIconFiles 的兜底图
+          # AppIcon.png 仅作参照/诊断图，不是 tvOS 的图标来源，
+          # 但仍随包分发，供 Assets.car 缺失时排查用
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.uncast.tv
