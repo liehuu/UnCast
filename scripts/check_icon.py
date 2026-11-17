@@ -292,10 +292,16 @@ def main() -> int:
     c = Checker()
 
     if target.endswith(".app"):
-        # 从 .app 反推仓库根，用于查源资源
-        check_sources(root, c)
-        check_plist_shape(c)
+        # .app 只作为"额外要查编译产物"的入口；源资源仍然从仓库根读。
+        #
+        # 这里用模块级 ROOT，**不留同名局部变量**。
+        # 踩过的坑：重构时把局部 root = ... 删了但忘了改调用点，
+        # 本机 check_icon.py . 走的是 else 分支所以永远测不到，
+        # 直到 CI Gate 2 才 NameError（run #32）。
+        # 教训已固化成 scripts/selftest_icon_paths.py：两条分支都要跑。
+        check_sources(ROOT, c)
         check_bundle(target, c)
+        check_plist_shape(c)
         title = "图标门禁"
     else:
         check_sources(target, c)
