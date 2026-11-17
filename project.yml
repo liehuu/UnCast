@@ -25,6 +25,7 @@ targets:
         excludes:
           - "App/Info.plist"
           - "App/UnCast.entitlements"
+          # AppIcon.png 保留进 bundle，作为 CFBundleIconFiles 的兜底图
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.uncast.tv
@@ -33,6 +34,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: UnCast/App/UnCast.entitlements
         GENERATE_INFOPLIST_FILE: "NO"
         ENABLE_BITCODE: "NO"
+        # 没有这一项 actool 不产出图标，主屏就是白块
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         # 完全关闭签名：CI 出未加密包，TrollStore 侧自行签名
         CODE_SIGN_IDENTITY: ""
         CODE_SIGNING_REQUIRED: "NO"

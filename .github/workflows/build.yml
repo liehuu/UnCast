@@ -215,7 +215,21 @@ jobs:
             exit 1
           fi
 
-      - name: Gate — verify artifact is installable on tvOS
+      - name: Gate 1 — 交互契约（方向键仲裁 / 控制层可恢复 / 图标接线）
+        run: |
+          # 这些是编译期发现不了的缺陷：v1 按左右永远快进（焦点进不了按钮），
+          # v2 焦点一旦进过按钮就永远出不来。两者都能 BUILD SUCCEEDED。
+          python3 scripts/verify_player.py
+          python3 scripts/check_icon.py .
+
+      - name: Gate 2 — 图标真的编进包了吗
+        run: |
+          # 逻辑放在脚本里，不写在 run: | 里。
+          # 原因：heredoc 内容一旦顶格，YAML 块标量会被截断，
+          # GitHub 侧表现为 run 直接 failure 且 total_count=0（没产生 job），极难查。
+          python3 scripts/check_icon.py Payload/UnCast.app
+
+      - name: Gate 3 — verify artifact is installable on tvOS
         run: |
           # 这一步是唯一的「能装吗」判据。
           # 上面 xcodebuild 成功、zip 成功都不能证明包可用；
