@@ -29,6 +29,23 @@ struct SettingsView: View {
                     Text("手机投屏时在设备列表里显示的名字就是「设备名称」。修改后需重启服务生效。")
                 }
 
+                // MARK: 投屏兼容性
+                //
+                // 这一段是为了让用户能自己分清两种「搜不到」：
+                // 1. 对方 App 只走 AirPlay/私有协议 —— 结构上不会看见 DLNA 设备，改不了；
+                // 2. 对方 App 走 DLNA 但没发现我们 —— 看下面 M-SEARCH 计数即可判定。
+                // 没有这段，用户只能靠猜，而猜测的默认结论往往是「这个 App 坏了」。
+                Section {
+                    settingRow("SSDP 搜索请求", "\(dlna.mSearchCount) 次")
+                    settingRow("已回复设备", "\(dlna.replyCount) 条")
+                    settingRow("通告次数", "\(dlna.notifyCount) 次")
+                    settingRow("支持的标准", "DLNA / UPnP · 仅此一种")
+                } header: {
+                    Text("投屏兼容性")
+                } footer: {
+                    Text("UnCast 只实现 DLNA/UPnP 接收端（DMR-1.50）。若某个 App 的投屏列表里始终没有这台电视，先让它的投屏列表保持打开，再看「SSDP 搜索请求」是否增加：\n• 增加 = 它在找 DLNA 设备，是兼容性问题，可查日志定位；\n• 一直为 0 = 它只走 AirPlay 或自家私有协议（如「电视联播码」），这类 App 无法发现任何第三方 DLNA 设备——包括原版 UnPlay。\nAirPlay 投屏由 tvOS 系统接收，不经本应用；那条路径上手机锁屏会中断播放。")
+                }
+
                 // MARK: 播放
                 Section {
                     Picker("默认播放模式", selection: $savedPlayMode) {

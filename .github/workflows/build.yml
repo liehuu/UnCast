@@ -215,7 +215,7 @@ jobs:
             exit 1
           fi
 
-      - name: Gate 1 — 交互契约 + 图标接线（含变异测试）
+      - name: Gate 1 — 交互契约 + 图标接线 + SSDP 发现契约（含变异测试）
         run: |
           # 这些是编译期发现不了的缺陷：v1 按左右永远快进（焦点进不了按钮），
           # v2 焦点一旦进过按钮就永远出不来。两者都能 BUILD SUCCEEDED。
@@ -227,6 +227,10 @@ jobs:
           # 本地全绿、CI 一上来 NameError 的。这条自检把两条路径都跑一遍。
           python3 scripts/selftest_icon_paths.py
           python3 scripts/verify_player_injection.py
+          # SSDP：ST 回显错误 / 无周期通告 / 缺裸 UDN / BOOTID 写死，
+          # 四个缺陷都能编译通过，只在真机对严苛客户端时表现为「搜不到设备」。
+          python3 scripts/verify_ssdp.py
+          python3 scripts/selftest_ssdp.py
 
       - name: Gate 2 — 图标真的编进包了吗
         run: |

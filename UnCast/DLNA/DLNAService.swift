@@ -25,6 +25,14 @@ final class DLNAService: ObservableObject {
     @Published private(set) var localIP = "—"
     @Published private(set) var castCount = 0
 
+    // 投屏兼容性计数器。用途是让用户用一次观察区分两种「搜不到」：
+    // 对方 App 根本不发 M-SEARCH（只走 AirPlay/私有协议）→ 计数恒为 0；
+    // 对方发了但我们没被认出来 → 计数在涨却没出现在列表里。
+    // 这两个现象的处理方式完全不同，没有计数器就只能靠猜。
+    @Published private(set) var mSearchCount = 0
+    @Published private(set) var replyCount = 0
+    @Published private(set) var notifyCount = 0
+
     struct LogEntry: Identifiable {
         let id = UUID()
         let time: Date
@@ -124,6 +132,15 @@ final class DLNAService: ObservableObject {
             httpPort: Self.httpPort
         ), log: { [weak self] msg in
             self?.appendLog(msg)
+        }, onEvent: { [weak self] event in
+            // 回调本身可能来自 SSDP 后台线程；appendLogOnMain 会派发到主线程，
+            // 这里只负责把事件翻译成计数，不直接写 @Published。
+            guard let self else { return }
+            switch event {
+            case .search: self.bump(.search)
+            case .reply(let n): self.bump(.reply, by: n)
+            case .notify(let n): self.bump(.notify, by: n)
+            }
         })
 
         do {
@@ -131,10 +148,8 @@ final class DLNAService: ObservableObject {
             lifecycleLock.lock()
             ssdp = responder
             lifecycleLock.unlock()
-            // 启动后立刻通告，手机端不必等 M-SEARCH 周期
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
-                responder.announceAlive()
-            }
+            // 启动通告由 SSDPResponder 内部的 notify 循环负责（含 0.3s 首次延迟），
+            // 这里不再重复发一次 —— 重复发只会让局域网多收 5 条无意义报文。
         } catch {
             let msg = "SSDP 启动失败：\(error.localizedDescription)"
             lifecycleLock.lock()
@@ -538,6 +553,27 @@ final class DLNAService: ObservableObject {
     /// 任意线程安全：统一在主线程改 @Published
     private func appendLog(_ message: String) {
         appendLogOnMain(message)
+    }
+
+    /// 计数器自增。
+    ///
+    /// 刻意不用 keyPath（`\DLNAService.mSearchCount`）省三行代码：
+    /// 那需要把 @Published private(set) 的属性当成可写 keypath 传出去，
+    /// 本机没有 Swift 工具链、无法本地验证能否编译。
+    /// 这里宁可啰嗦，也不要引入一个只能在 CI 上才暴露的错误。
+    private func bump(_ kind: Kind, by delta: Int = 1) {
+        onMain { [weak self] in
+            guard let self else { return }
+            switch kind {
+            case .search: self.mSearchCount += delta
+            case .reply: self.replyCount += delta
+            case .notify: self.notifyCount += delta
+            }
+        }
+    }
+
+    private enum Kind {
+        case search, reply, notify
     }
 
     private func appendLogOnMain(_ message: String) {

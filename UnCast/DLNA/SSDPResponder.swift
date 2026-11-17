@@ -42,6 +42,43 @@ final class SSDPResponder {
         }
     }
 
+    // MARK: - 通告目录（SSDP 的单一事实源）
+
+    /// 本机对外通告的全部 search target（NT）。
+    ///
+    /// 这是唯一事实源：`replyTargets` 用它回答 `ssdp:all`，
+    /// `sendNotify` 用它逐条发 NOTIFY。改这里等于同时改发现与通告。
+    ///
+    /// 为什么必须逐个通告，而不是只认一个：
+    /// 客户端常以 `ST: ssdp:all` 搜索，然后**只接受 ST 恰好等于
+    /// `urn:schemas-upnp-org:device:MediaRenderer:1` 的那条回复**。
+    /// 早先版本收到 `ssdp:all` 时原样回一条 `ST: ssdp:all`，
+    /// 严格实现的客户端会判定「这不是我要的设备类型」并丢弃整条回复 ——
+    /// 于是设备在它的列表里就是不出现，而 M-SEARCH 日志里却明明有记录。
+    static let searchTargets: [String] = [
+        "upnp:rootdevice",
+        "urn:schemas-upnp-org:device:MediaRenderer:1",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "urn:schemas-upnp-org:service:RenderingControl:1",
+        "urn:schemas-upnp-org:service:ConnectionManager:1"
+    ]
+
+    /// 通告有效期。NOTIFY 的周期必须是它的 1/2，否则两次通告之间缓存就过期了：
+    /// 手机过一会儿再翻设备列表，设备已经不在缓存里。
+    static let maxAge = 1800
+    static let notifyInterval: TimeInterval = Double(maxAge) / 2
+
+    /// 每次进程启动递增。
+    ///
+    /// UPnP 1.1 规定 BOOTID 变化时客户端必须丢弃旧缓存重新拉描述。
+    /// 写死常量的话，App 重启后换端口/换服务列表，客户端还在用旧缓存连不上。
+    private static let bootID: Int = {
+        let key = "uncast.ssdp.bootid"
+        let next = UserDefaults.standard.integer(forKey: key) + 1
+        UserDefaults.standard.set(next, forKey: key)
+        return next
+    }()
+
     private let config: Config
     private var socketFD: Int32 = -1
     private var recvThread: Thread?
@@ -49,9 +86,24 @@ final class SSDPResponder {
     private var isRunning = false
     private let log: (String) -> Void
 
-    init(config: Config, log: @escaping (String) -> Void = { _ in }) {
+    /// 统计回调。参数是事件类型，由上层累加到 @Published 计数。
+    ///
+    /// 用回调而不是让本类持有计数器：本类跑在后台线程，
+    /// 直接改 @Published 会触发 SwiftUI 的「不在主线程发布」问题。
+    /// 上层的 appendLog 已经统一派发到主线程，走同一条路最省事。
+    enum Event {
+        case search          // 收到一条 M-SEARCH
+        case reply(Int)      // 回了几条 200 OK
+        case notify(Int)     // 发了几条 NOTIFY
+    }
+    private let onEvent: (Event) -> Void
+
+    init(config: Config,
+         log: @escaping (String) -> Void = { _ in },
+         onEvent: @escaping (Event) -> Void = { _ in }) {
         self.config = config
         self.log = log
+        self.onEvent = onEvent
     }
 
     // MARK: - 生命周期
@@ -99,7 +151,11 @@ final class SSDPResponder {
         t.start()
         recvThread = t
 
-        log("SSDP 监听中 239.255.255.250:\(config.port)")
+        // 周期通告。必须在 isRunning 置真之后启动，
+        // 否则循环体第一次判断就退出了。
+        startNotifyLoop()
+
+        log("SSDP 监听中 \(config.multicastGroup):\(config.port)，\(Self.searchTargets.count) 个 target")
     }
 
     func stop() {
@@ -202,25 +258,50 @@ final class SSDPResponder {
             // 只处理 ssdp:discover
             guard man.uppercased().contains("SSDP:DISCOVER") else { continue }
 
-            guard stMatches(st) else { continue }
+            let targets = replyTargets(for: st)
+            guard !targets.isEmpty else { continue }
 
             let target = Self.ipString(sender.sin_addr)
             let targetPort = UInt16(bigEndian: sender.sin_port)
-            log("M-SEARCH from \(target):\(targetPort) ST=\(st.prefix(48))")
+            onEvent(.search)
+            onEvent(.reply(targets.count))
+            log("M-SEARCH from \(target):\(targetPort) ST=\(st.prefix(48)) → \(targets.count) 条回复")
 
-            respondUnicast(to: target, port: targetPort, st: st)
+            for t in targets {
+                respondUnicast(to: target, port: targetPort, st: t)
+            }
         }
     }
 
-    private func stMatches(_ st: String) -> Bool {
+    /// 根据客户端发来的 ST 决定要回哪些 ST。
+    ///
+    /// 关键点：`ssdp:all` / `upnp:rootdevice` **不能原样回显**。
+    /// 客户端按 ST 匹配设备类型，回一条 `ST: ssdp:all` 等于告诉它
+    /// 「这个设备是 ssdp:all 类型」——没有一个客户端认这个类型。
+    /// 正确做法是对 `ssdp:all` 把每个具体 target 各回一条。
+    private func replyTargets(for st: String) -> [String] {
         let s = st.lowercased()
-        if s == "ssdp:all" { return true }
-        if s == "upnp:rootdevice" { return true }
-        if s.hasPrefix("urn:schemas-upnp-org:device:mediarenderer") { return true }
-        if s.hasPrefix("urn:schemas-upnp-org:service:avtransport") { return true }
-        if s.hasPrefix("urn:schemas-upnp-org:service:renderingcontrol") { return true }
-        if s.hasPrefix("urn:schemas-upnp-org:service:connectionmanager") { return true }
-        return false
+        if s == "ssdp:all" {
+            // UPnP 1.1 §1.2.3：ssdp:all 要为**每一类通告**各回一条，
+            // 其中包括裸 UDN（ST/USN 都是 uuid:xxx）。
+            // 少数基于 Cling 的老客户端正是靠这条认设备的，不能省。
+            return ["uuid:\(config.uuid)"] + Self.searchTargets
+        }
+        if s == "upnp:rootdevice" { return ["upnp:rootdevice"] }
+        if s == "uuid:\(config.uuid.lowercased())" { return ["uuid:\(config.uuid)"] }
+        // 精确命中某个 target 时回它自己
+        for known in Self.searchTargets where s == known.lowercased() {
+            return [known]
+        }
+        // 版本号不同的（如 MediaRenderer:2）也接受，但回客户端请求的那个版本号，
+        // 否则它同样不认。
+        if s.hasPrefix("urn:schemas-upnp-org:device:mediarenderer")
+            || s.hasPrefix("urn:schemas-upnp-org:service:avtransport")
+            || s.hasPrefix("urn:schemas-upnp-org:service:renderingcontrol")
+            || s.hasPrefix("urn:schemas-upnp-org:service:connectionmanager") {
+            return [st]
+        }
+        return []
     }
 
     /// 单播回复 M-SEARCH。必须发到请求来源的 IP:端口，不能往 1900 组播回。
@@ -230,13 +311,14 @@ final class SSDPResponder {
 
         let lines = [
             "HTTP/1.1 200 OK",
-            "CACHE-CONTROL: max-age=1800",
+            "CACHE-CONTROL: max-age=\(Self.maxAge)",
+            "DATE: \(Self.httpDate())",
             "EXT:",
             "LOCATION: \(location)",
-            "SERVER: UnCast/1.0 UPnP/1.0 DLNADOC/1.50",
+            "SERVER: \(Self.serverString)",
             "ST: \(target)",
-            "USN: uuid:\(config.uuid)::\(target)",
-            "BOOTID.UPNP.ORG: 1",
+            "USN: \(usn(for: target))",
+            "BOOTID.UPNP.ORG: \(Self.bootID)",
             "CONFIGID.UPNP.ORG: 1"
         ]
         // SSDP 报文必须以空行（\r\n\r\n）结尾
@@ -244,32 +326,77 @@ final class SSDPResponder {
         sendUDP(payload, to: ip, port: port)
     }
 
+    /// USN 规则（UPnP 1.1 §1.2.2）：
+    /// - 裸 UDN 那一条：`NT = uuid:<udn>`、`USN = uuid:<udn>`（**不加后缀**）
+    /// - 其余 target：`USN = uuid:<udn>::<target>`
+    ///
+    /// 裸 UDN 也加 ::uuid:xxx 后缀的话，同一条通告会被客户端解析成两个不同的 USN，
+    /// 设备列表里就会出现一个认不出类型的幽灵条目。
+    private func usn(for target: String) -> String {
+        if target.lowercased().hasPrefix("uuid:") { return target }
+        return "uuid:\(config.uuid)::\(target)"
+    }
+
+    /// RFC 1123 日期。UPnP 1.1 起 DATE 头是必须的，
+    /// 缺了它部分客户端会认为响应不可信（无法判断缓存新鲜度）。
+    static func httpDate() -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(identifier: "GMT")
+        fmt.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        return fmt.string(from: Date())
+    }
+
+    static let serverString = "Darwin/1.0 UPnP/1.1 UnCast/1.0"
+
     private func sendNotify(nts: String) {
         let location = "http://\(Self.localIPAddress()):\(config.httpPort)/dd.xml"
-        let targets = [
-            "upnp:rootdevice",
-            "urn:schemas-upnp-org:device:MediaRenderer:1",
-            "urn:schemas-upnp-org:service:AVTransport:1",
-            "urn:schemas-upnp-org:service:RenderingControl:1",
-            "urn:schemas-upnp-org:service:ConnectionManager:1"
-        ]
+        // 裸 UDN 那条也必须通告，否则客户端不会把「设备本身」记进缓存。
+        let targets = ["uuid:\(config.uuid)"] + Self.searchTargets
         for nt in targets {
             let lines = [
                 "NOTIFY * HTTP/1.1",
                 "HOST: \(config.multicastGroup):\(config.port)",
-                "CACHE-CONTROL: max-age=1800",
+                "CACHE-CONTROL: max-age=\(Self.maxAge)",
                 "LOCATION: \(location)",
                 "NT: \(nt)",
                 "NTS: \(nts)",
-                "SERVER: UnCast/1.0 UPnP/1.0 DLNADOC/1.50",
-                "USN: uuid:\(config.uuid)::\(nt)",
-                "BOOTID.UPNP.ORG: 1",
+                "SERVER: \(Self.serverString)",
+                "USN: \(usn(for: nt))",
+                "BOOTID.UPNP.ORG: \(Self.bootID)",
                 "CONFIGID.UPNP.ORG: 1"
             ]
             let payload = lines.joined(separator: "\r\n") + "\r\n\r\n"
             sendUDP(payload, to: config.multicastGroup, port: config.port)
         }
-        log("已发送 NOTIFY \(nts)")
+        log("已发送 NOTIFY \(nts) × \(targets.count)")
+        onEvent(.notify(targets.count))
+    }
+
+    /// 周期重发 alive。
+    ///
+    /// 没有这个循环，设备只在启动那一刻被通告一次：
+    /// 手机端缓存过期（max-age 到点）后再打开投屏列表，
+    /// 设备列表就是空的，得重启 App 才能再看到 —— 症状很像「有时候搜不到」。
+    private func startNotifyLoop() {
+        let t = Thread { [weak self] in
+            guard let self else { return }
+            // 首次延迟 0.3s，避免和 HTTP 启动抢时间
+            Thread.sleep(forTimeInterval: 0.3)
+            while self.isRunning {
+                self.announceAlive()
+                // 按 1/2 周期切段睡，让 stop() 能较快退出
+                var slept: TimeInterval = 0
+                while slept < Self.notifyInterval && self.isRunning {
+                    Thread.sleep(forTimeInterval: 1.0)
+                    slept += 1.0
+                }
+            }
+        }
+        t.name = "ssdp.notify"
+        t.qualityOfService = .utility
+        t.start()
+        notifyThread = t
     }
 
     private func sendUDP(_ text: String, to ip: String, port: UInt16) {
