@@ -75,6 +75,29 @@ struct PlayerView: View {
     @State private var seekHint: Int = 0
     @State private var seekHintTask: Task<Void, Never>?
 
+    // MARK: - 连按累进 seek
+
+    /// 连按窗口：同方向两次按键间隔小于此值算「一次连按序列」。
+    ///
+    /// 取 1.0 秒的理由：电视遥控器连按的手感区间大约 0.6~1.2 秒，
+    /// 太短（<0.5s）正常人连不上，太长（>1.5s）会让两次独立操作被误并。
+    private static let seekStreakWindow: UInt64 = 1_000_000_000
+
+    /// 连按序列的**起始播放位置**。
+    ///
+    /// 为什么不直接累加 `engine.currentTime`：`seek` 是异步的，
+    /// 连按时上一次 seek 可能还没落地，`currentTime` 仍是旧值。
+    /// 按「再 +45 秒」那样累加会基于旧位置计算，跳转量偏小。
+    /// 改成记住序列起点、每次用「起点 + 累计偏移」做绝对定位，
+    /// 结果与按键速度无关。
+    @State private var seekAnchor: Double?
+    /// 本次连按序列按了几次（1 = 首次）
+    @State private var seekStreak: Int = 0
+    /// 本次序列的方向（+1 快进 / -1 快退），方向一变就重新起算
+    @State private var seekSign: Int = 0
+    /// 超时后清掉连按状态，下次按键重新从 15 秒起算
+    @State private var seekStreakTask: Task<Void, Never>?
+
     var body: some View {
         playerLayer
     }
@@ -147,11 +170,21 @@ struct PlayerView: View {
             restartHide()
         }
         .onExitCommand(perform: handleExitFromButtons)
-        // 按钮态的「下」= 收起控制层。
-        // 其余两态方向键已被 UIKit 层吃掉，这条 guard 保证不会重复处理。
+        // 按钮态的方向键由焦点引擎派发到这里（锚点的 canBecomeFocused
+        // 已关，按键不会被 UIKit 层截走），所以这两个方向要在这里处理：
+        //   ↑ 退回进度条态（按钮行收起，但进度条留下）
+        //   ↓ 收起整个控制层
+        // 其余两态方向键被 UIKit 层的 pressesBegan 吃掉，这条 guard 挡住重复处理。
         .onMoveCommand { direction in
             guard level == .buttons else { return }
-            if direction == .down { withAnimation { level = .hidden } }
+            switch direction {
+            case .up:
+                withAnimation { level = .progress }
+            case .down:
+                withAnimation { level = .hidden }
+            default:
+                break
+            }
         }
         .onChange(of: level) { newLevel in
             if newLevel == .buttons {
@@ -181,6 +214,8 @@ struct PlayerView: View {
         .onDisappear {
             hideTask?.cancel()
             seekHintTask?.cancel()
+            // 连按序列的计时器也要收掉，否则视图销毁后闭包仍会醒一次
+            seekStreakTask?.cancel()
         }
     }
 
@@ -213,9 +248,9 @@ struct PlayerView: View {
     private func handleMove(_ direction: MoveCommandDirection) {
         switch direction {
         case .left:
-            seek(-15)
+            seek(-1)
         case .right:
-            seek(15)
+            seek(1)
         case .up:
             // **上下键都能呼出进度条**（用户明确要求）。
             // 已经在控制层里时，上 = 收起。
@@ -270,14 +305,78 @@ struct PlayerView: View {
         }
     }
 
-    private func seek(_ delta: Double) {
-        engine.seek(by: delta)
-        showSeekHint(Int(delta))
+    /// 连按累进的跳转档位（秒，绝对值，表示**累计**跳多少）。
+    ///
+    /// 用户要求：按一次 15 秒、连按两次 1 分钟、连按三次 5 分钟。
+    /// 索引 = 连按次数 - 1。
+    private static let seekSteps: [Double] = [15, 60, 300]
+
+    /// 第 3 次之后每次再加的量。
+    ///
+    /// 为什么不是"停在第 3 档不再增长"：用户第 4 次按下时想要的是
+    /// "再往前跳一大段"，而不是"又回到同一个 5 分钟位置"。
+    /// 停在原地会让人以为按键失灵。所以第 4 次起按 5 分钟递进：
+    /// 第 4 次累计 10 分钟、第 5 次 15 分钟……
+    private static let seekTailStep: Double = 300
+
+    private static func seekOffset(forStreak streak: Int) -> Double {
+        guard streak > 0 else { return seekSteps[0] }
+        if streak <= seekSteps.count {
+            return seekSteps[streak - 1]
+        }
+        // 超出档位表：最后一档 + 每多按一次再加一段
+        let extra = Double(streak - seekSteps.count) * seekTailStep
+        return seekSteps[seekSteps.count - 1] + extra
+    }
+
+    /// 左右键的 seek 入口，带连按累进。
+    ///
+    /// `sign` 只取 ±1（方向），快进快退的**距离**由连按次数决定，
+    /// 不由调用方传 —— 这样档位只在一处定义（`seekSteps`），
+    /// 不会出现"按键处写 15、算法里又改 60"的双真源。
+    private func seek(_ sign: Int) {
+        let dir = sign >= 0 ? 1 : -1
+
+        // 方向变了 / 上一轮已超时 → 重新起一个序列
+        let continuing = (seekSign == dir) && (seekStreak > 0) && (seekAnchor != nil)
+        if !continuing {
+            seekAnchor = engine.currentTime
+            seekStreak = 0
+        }
+        seekSign = dir
+        seekStreak += 1
+
+        let magnitude = Self.seekOffset(forStreak: seekStreak)
+        let delta = magnitude * Double(dir)
+        let anchor = seekAnchor ?? engine.currentTime
+
+        // 绝对定位：起点 + 累计偏移，再夹到 [0, duration]
+        let maxTime = engine.duration > 0 ? engine.duration : anchor + magnitude
+        let target = min(max(0, anchor + delta), maxTime)
+        engine.seek(to: target)
+        // 提示显示的是**本次按键累计跳了多少**，不是单次增量 ——
+        // 连按时用户要看的是"已经跳到哪了"，不是"这一下跳了几秒"
+        showSeekHint(Int(delta.rounded()))
+
         // 快进快退必须能看见进度条，否则用户不知道跳到哪了
         if level == .hidden {
             withAnimation { level = .progress }
         }
         restartHide()
+        armSeekStreakTimeout()
+    }
+
+    /// 连按窗口计时：窗口内没等到下一次按键就结束本序列。
+    private func armSeekStreakTimeout() {
+        seekStreakTask?.cancel()
+        seekStreakTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: Self.seekStreakWindow)
+            guard !Task.isCancelled else { return }
+            // 只清序列状态，不动播放位置
+            seekStreak = 0
+            seekSign = 0
+            seekAnchor = nil
+        }
     }
 
     // MARK: - 控制层（一）：进度条
@@ -364,7 +463,10 @@ struct PlayerView: View {
         HStack(spacing: 26) {
             CircleButton(icon: "gobackward.15", size: 26,
                          focus: $focus, tag: .rewind) {
-                engine.seek(by: -15); showSeekHint(-15); restartHide()
+                // 和遥控器左右键走同一个入口，连点按钮也能累进到 1 分钟 / 5 分钟。
+                // 不用 engine.seek(by: -15)：那是相对当前位置算，连点时上一次
+                // seek 还没落地会少跳（见 seekAnchor 的注释）。
+                seek(-1)
             }
 
             CircleButton(icon: "backward.end.fill", size: 26,
@@ -385,7 +487,7 @@ struct PlayerView: View {
 
             CircleButton(icon: "goforward.15", size: 26,
                          focus: $focus, tag: .forward) {
-                engine.seek(by: 15); showSeekHint(15); restartHide()
+                seek(1)
             }
 
             Spacer()
@@ -448,15 +550,37 @@ struct PlayerView: View {
 
     private var seekHintOverlay: some View {
         HStack(spacing: 10) {
-            Image(systemName: seekHint > 0 ? "goforward.15" : "gobackward.15")
+            Image(systemName: seekHintIcon)
                 .font(.system(size: 40, weight: .semibold))
-            Text(seekHint > 0 ? "+\(seekHint)s" : "\(seekHint)s")
+            Text(seekHintLabel)
                 .font(.system(size: 32, weight: .bold, design: .rounded))
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 34)
         .padding(.vertical, 20)
         .background(Color.black.opacity(0.55), in: Capsule())
+    }
+
+    /// 连按档位不同，图标也不同 —— 一眼能看出这回是按了一次还是三次。
+    ///
+    /// 系统符号里 15 / 30 / 45 / 60 / 75 / 90 秒都有，5 分钟没有对应
+    /// 符号，用无边界的 goforward/gobackward 代替（表示"跳了一大段"）。
+    private var seekHintIcon: String {
+        let fwd = seekHint > 0
+        let mag = abs(seekHint)
+        if mag >= 300 { return fwd ? "goforward" : "gobackward" }
+        if mag >= 60 { return fwd ? "goforward.60" : "gobackward.60" }
+        return fwd ? "goforward.15" : "gobackward.15"
+    }
+
+    /// 300 秒写成 `+5:00`，比 `+300s` 好读。
+    private var seekHintLabel: String {
+        let sign = seekHint > 0 ? "+" : "-"
+        let mag = abs(seekHint)
+        if mag >= 60 {
+            return String(format: "%@%d:%02d", sign, mag / 60, mag % 60)
+        }
+        return "\(sign)\(mag)s"
     }
 
     private func showSeekHint(_ seconds: Int) {

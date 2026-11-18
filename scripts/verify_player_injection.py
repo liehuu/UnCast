@@ -250,12 +250,20 @@ def main() -> int:
         "进度条层不含按钮行",
         results)
 
-    # B7: seek 步长改错
+    # B7: 左右键方向写反（按左反而快进）。
+    #     这条只验方向语义 —— 步长已由连按档位接管，
+    #     改步长的等价破坏见 C1（档位顺序错）。
     with_patch(
-        """            seek(-15)""",
-        """            seek(-30)""",
-        "B7 seek 步长改为 -30",
-        "左右分别为",
+        """        case .left:
+            seek(-1)
+        case .right:
+            seek(1)""",
+        """        case .left:
+            seek(1)
+        case .right:
+            seek(-1)""",
+        "B7 左右键方向写反",
+        "左右键只传方向",
         results)
 
     # B8: 去掉 focusSection
@@ -342,6 +350,116 @@ def main() -> int:
             switch type {""",
         "B13 press.type 当可选（iOS 写法，tvOS 编译不过）",
         "不把 press.type 当可选",
+        results)
+
+    print("\n== C. 连按累进 + 按钮态上键回退（v1.0.2 新增）==")
+
+    # C1: 档位顺序写错（15/300/60）—— 子串判断抓不到顺序错误
+    with_patch(
+        """    private static let seekSteps: [Double] = [15, 60, 300]""",
+        """    private static let seekSteps: [Double] = [15, 300, 60]""",
+        "C1 档位顺序错成 15/300/60",
+        "档位顺序为 15 / 60 / 300 秒",
+        results)
+
+    # C2: 回退成相对累加（异步 seek 下会少跳）
+    with_patch(
+        """        engine.seek(to: target)""",
+        """        engine.seek(by: delta)""",
+        "C2 回退成相对累加 seek(by:)",
+        "走绝对定位 engine.seek(to:)",
+        results)
+
+    # C3: 不记序列起点，每次都读 currentTime（连按必少跳）
+    with_patch(
+        """            seekAnchor = engine.currentTime
+            seekStreak = 0""",
+        """            seekStreak = 0""",
+        "C3 不记序列起点（连按少跳）",
+        "把 engine.currentTime 存进 seekAnchor",
+        results)
+
+    # C4: 换方向不重新起算（快进3次后立刻快退，会从 5 分钟起跳）
+    with_patch(
+        """        let continuing = (seekSign == dir) && (seekStreak > 0) && (seekAnchor != nil)""",
+        """        let continuing = (seekStreak > 0) && (seekAnchor != nil)""",
+        "C4 换方向不重新起算",
+        "换方向时重新起算",
+        results)
+
+    # C5: 超时后不复位（下次按键直接从 5 分钟起跳）
+    with_patch(
+        """            seekStreak = 0
+            seekSign = 0
+            seekAnchor = nil""",
+        """            _ = seekStreak""",
+        "C5 超时后不复位连按状态",
+        ("超时后把 seekStreak 归零", "超时后把 seekSign 归零",
+         "超时后把 seekAnchor 置 nil"),
+        results)
+
+    # C6: 越界不夹紧（跳到 duration 之外，AVPlayer 会停在末尾或异常）
+    with_patch(
+        """        let target = min(max(0, anchor + delta), maxTime)""",
+        """        let target = anchor + delta""",
+        "C6 目标位置不夹紧",
+        "目标位置夹在 [0, duration] 内",
+        results)
+
+    # C7: 按钮行的快进退回 engine.seek(by:)（与方向键行为不一致）
+    with_patch(
+        """            CircleButton(icon: "goforward.15", size: 26,
+                         focus: $focus, tag: .forward) {
+                seek(1)
+            }""",
+        """            CircleButton(icon: "goforward.15", size: 26,
+                         focus: $focus, tag: .forward) {
+                engine.seek(by: 15); showSeekHint(15); restartHide()
+            }""",
+        "C7 按钮行快进不走统一入口",
+        "按钮行的快退/快进也走 seek() 入口",
+        results)
+
+    # C8: 按钮态按上不回退（就是用户这次报的第一个问题）
+    with_patch(
+        """            case .up:
+                withAnimation { level = .progress }
+            case .down:
+                withAnimation { level = .hidden }""",
+        """            case .up:
+                break
+            case .down:
+                withAnimation { level = .hidden }""",
+        "C8 按钮态按上不回进度条（用户报的问题）",
+        "按钮态按上退回进度条态",
+        results)
+
+    # C9: 上回退写成收起控制层（方向搞反）
+    with_patch(
+        """            case .up:
+                withAnimation { level = .progress }
+            case .down:
+                withAnimation { level = .hidden }""",
+        """            case .up:
+                withAnimation { level = .hidden }
+            case .down:
+                withAnimation { level = .hidden }""",
+        "C9 上回退写成收起控制层",
+        "按钮态按上退回进度条态",
+        results)
+
+    # C10: onMoveCommand 的按钮态 guard 被删（会与 UIKit 层双触发）。
+    #      注意不能只写 `guard level == .buttons else { return }` ——
+    #      源码里 onPlayPauseCommand 也有一模一样的一行，replace(…, 1)
+    #      会先命中上面那个，改错了地方（变异测试 C10 首版就栽在这）。
+    #      锚点必须带上下文，钉死到 onMoveCommand 那一段。
+    with_patch(
+        """        .onMoveCommand { direction in
+            guard level == .buttons else { return }""",
+        """        .onMoveCommand { direction in
+            // 注入：不判断状态""",
+        "C10 onMoveCommand 不判断按钮态（双触发）",
+        "onMoveCommand 只在按钮态生效",
         results)
 
     print()

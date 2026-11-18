@@ -330,10 +330,14 @@ def main() -> int:
     handle = body_of(src, "private func handleMove")
     c.check(bool(handle), "handleMove 存在")
     if handle:
-        # 左右始终 seek，步长 15
+        # 左右键传的是**方向**（±1），距离由连按档位决定。
+        #
+        # 早先断言写的是「左右分别为 -15 / +15」，改成累进后这条必然失败。
+        # 但顺手暴露了一个设计问题：如果按键处写 15、算法里又改成 60，
+        # 就是双真源。现在档位只在 seekSteps 一处定义，按键只传方向。
         seek_calls = re.findall(r"\bseek\((-?\d+)\)", handle)
-        c.check(seek_calls == ["-15", "15"],
-                "左右分别为 -15 / +15 秒", str(seek_calls))
+        c.check(seek_calls == ["-1", "1"],
+                "左右键只传方向 ±1（距离由连按档位单点定义）", str(seek_calls))
 
         # 下：hidden → progress → buttons（逐级展开）
         down_body = case_arm(handle, ".down")
@@ -365,6 +369,107 @@ def main() -> int:
             c.check("level = .hidden" in u_arms.get(".progress, .buttons", ""),
                     "上键在控制层里时收起",
                     u_arms.get(".progress, .buttons", "").strip()[:60])
+
+    # ─────────────────────────── 3.5 连按累进 seek
+    print("\n== 3.5 左右键连按累进（15s → 1min → 5min）==")
+
+    # 档位表必须存在且顺序正确。这条不能只查"出现了 15/60/300"，
+    # 因为顺序错（比如 [15, 300, 60]）子串判断照样过。
+    m = re.search(r"seekSteps\s*(?::\s*\[Double\]\s*)?=\s*\[([^\]]+)\]", src)
+    c.check(m is not None, "存在 seekSteps 档位表")
+    if m:
+        vals = [v.strip().rstrip("dD") for v in m.group(1).split(",")]
+        c.check(vals == ["15", "60", "300"],
+                "档位顺序为 15 / 60 / 300 秒", str(vals))
+
+    # 档位表里不能夹带负数或 0（否则会算出"快速反向跳"这种怪行为）
+    if m:
+        nums = [float(v) for v in vals if re.fullmatch(r"\d+(?:\.\d+)?", v)]
+        c.check(len(nums) == 3 and all(n > 0 for n in nums),
+                "档位全为正数（方向由符号单独决定）", str(nums))
+
+    # 第 3 次之后要继续递进，不能停在原地。
+    # 停住的话用户第 4 次按下会看到同一个 5 分钟提示，以为按键失灵。
+    c.check(re.search(r"seekTailStep\s*:\s*Double\s*=\s*300", src) is not None,
+            "第 3 档之后有递进步长 seekTailStep")
+    offset_fn = body_of(src, "static func seekOffset")
+    c.check(bool(offset_fn), "存在 seekOffset 档位计算函数")
+    if offset_fn:
+        c.check(re.search(r"streak\s*<=\s*seekSteps\.count", offset_fn) is not None,
+                "档位表内按索引取值")
+        c.check(re.search(r"streak\s*-\s*seekSteps\.count", offset_fn) is not None,
+                "超出档位表后按次数递进（不是原地停在最后一档）")
+
+    seekfn = body_of(src, "private func seek(")
+    c.check(bool(seekfn), "seek 函数存在")
+    if seekfn:
+        # 累进的核心是「记住序列起点」，不能基于 currentTime 反复相对累加。
+        # 理由：seek 是异步的，连按时 currentTime 还没更新，相对累加会少跳。
+        #
+        # 判据必须钉在**赋值动作**上，不能只查 `"seekAnchor" in seekfn`：
+        # 变量名在 `seekAnchor ?? ...`、`seekAnchor != nil` 里都出现，
+        # 把 `seekAnchor = engine.currentTime` 删掉后子串依然命中 ——
+        # 变异测试 C3 就是这么报假 PASS 的。
+        c.check(re.search(r"seekAnchor\s*=\s*engine\.currentTime", seekfn) is not None,
+                "把 engine.currentTime 存进 seekAnchor（序列起点）")
+        c.check("engine.seek(to:" in seekfn,
+                "走绝对定位 engine.seek(to:)（不是 seek(by:)）")
+        c.check("engine.seek(by:" not in seekfn,
+                "不基于 currentTime 做相对累加")
+        # 方向必须参与「是否延续序列」的判断。
+        # 只查 `"seekSign" in seekfn` 同样无效：`seekSign = dir` 让它永远为真。
+        c.check(re.search(r"seekSign\s*==\s*dir", seekfn) is not None,
+                "换方向时重新起算（seekSign == dir 参与延续判断）")
+        c.check(re.search(r"seekStreak\s*\+=\s*1", seekfn) is not None,
+                "每次按键累加连按次数")
+        # 越界夹紧
+        c.check(re.search(r"min\(max\(0,\s*anchor\s*\+\s*delta\)", seekfn) is not None,
+                "目标位置夹在 [0, duration] 内")
+        # 连按窗口超时后必须复位，否则下一个序列会从 5 分钟起跳
+        c.check("armSeekStreakTimeout" in seekfn,
+                "每次按键都重置连按窗口计时")
+
+    timeout_fn = body_of(src, "private func armSeekStreakTimeout")
+    c.check(bool(timeout_fn), "存在连按窗口超时函数")
+    if timeout_fn:
+        # 复位必须是「赋回初始值」，不能只查变量名后面跟了个等号 ——
+        # 注入 `_ = seekStreak` 这种"读一下但不改"的写法就能骗过旧断言。
+        c.check(re.search(r"seekStreak\s*=\s*0\b", timeout_fn) is not None,
+                "超时后把 seekStreak 归零（否则下次从大档位起跳）")
+        c.check(re.search(r"seekSign\s*=\s*0\b", timeout_fn) is not None,
+                "超时后把 seekSign 归零（否则方向判定的延续条件永远成立）")
+        c.check(re.search(r"seekAnchor\s*=\s*nil\b", timeout_fn) is not None,
+                "超时后把 seekAnchor 置 nil（否则沿用过期的起点）")
+        # 还要确认真的 sleep 了窗口时长，否则立即复位等于连按永远无效
+        c.check(re.search(r"Task\.sleep\(nanoseconds:\s*Self\.seekStreakWindow",
+                          timeout_fn) is not None,
+                "真正等待连按窗口时长后再复位")
+
+    # 按钮行的 ±15 按钮也要走同一入口，否则遥控器与按钮行为不一致
+    cb = body_of(src, "private var controlButtons")
+    if cb:
+        c.check("engine.seek(by: -15)" not in cb and "engine.seek(by: 15)" not in cb,
+                "按钮行的快退/快进也走 seek() 入口（与方向键一致）")
+
+    # ─────────────────────────── 3.6 按钮态的上键回退
+    print("\n== 3.6 按钮行按上要退回进度条 ==")
+
+    # 按钮态方向键由焦点引擎派发到 onMoveCommand，锚点此时已让位。
+    # 所以「上回退」必须写在 onMoveCommand 里，写进 handleMove 是死代码
+    # （按钮态 capturesKeys=false，pressesBegan 直接放行，handleMove 收不到）。
+    move_cmd = body_of(src, ".onMoveCommand")
+    c.check(bool(move_cmd), "存在 onMoveCommand（按钮态的方向键入口）")
+    if move_cmd:
+        c.check(re.search(r"guard\s+level\s*==\s*\.buttons", move_cmd) is not None,
+                "onMoveCommand 只在按钮态生效（其余两态由 UIKit 层处理）")
+        # 精确切分支，避免子串被 case 标签本身命中
+        mc_arms = dict(switch_arms(move_cmd))
+        c.check("level = .progress" in mc_arms.get(".up", ""),
+                "按钮态按上退回进度条态",
+                mc_arms.get(".up", "").strip()[:60])
+        c.check("level = .hidden" in mc_arms.get(".down", ""),
+                "按钮态按下收起整个控制层",
+                mc_arms.get(".down", "").strip()[:60])
 
     # ─────────────────────────── 4. 控制层可恢复性
     print("\n== 4. 控制层隐藏后必须可恢复 ==")
