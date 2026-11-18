@@ -37,6 +37,12 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 
 仓库 `dist/UnCast-1.0.3.tipa` 就是可直接安装的成品（由 GitHub Actions 构建）。
 
+下载地址（Release 直链，Apple TV 上可直接用「文件」App 打开）：
+
+```
+https://github.com/liehuu/UnCast/releases/download/v1.0.3/UnCast-1.0.3.tipa
+```
+
 | 项 | 值 |
 |---|---|
 | 版本 | 1.0.3（build 4） |
