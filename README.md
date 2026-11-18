@@ -713,8 +713,8 @@ resp.headers["SID"] = "uuid:\(uuid)-event"
 ### 怎么自己验证这块
 
 ```bash
-python3 scripts/verify_gena.py            # 37 条：SCPD 声明 / 源码接线 / 订阅行为
-python3 scripts/selftest_gena_red.py      # 13 条反向验证（6 项注入），证明上面那些断言真会红
+python3 scripts/verify_gena.py            # 55 条：SCPD 声明 / 源码接线 / 服务分流 / 订阅行为
+python3 scripts/selftest_gena_red.py      # 23 条反向验证（11 项注入），证明上面那些断言真会红
 python3 scripts/verify_setnext.py         # 13 条：预载不得打断当前播放
 python3 scripts/selftest_setnext_red.py   # 6 条反向：换回旧实现必须变红
 ```

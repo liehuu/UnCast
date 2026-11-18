@@ -89,10 +89,11 @@ class SubModel:
                 return min(int(num), SubModel.TIMEOUT)
         return SubModel.TIMEOUT
 
-    def subscribe(self, callback, timeout=None):
+    def subscribe(self, callback, timeout=None, service="AVTransport"):
         sid = "uuid:test-" + str(len(self.subs) + 1)
         self.subs[sid] = {
             "callback": callback,
+            "service": service,
             "expires": datetime.now() + timedelta(
                 seconds=timeout or self.TIMEOUT),
             "seq": 0,
@@ -110,14 +111,28 @@ class SubModel:
     def unsubscribe(self, sid):
         return self.subs.pop(sid, None) is not None
 
-    def take_targets(self):
+    def take_targets(self, service=None):
         now = datetime.now()
         self.subs = {k: v for k, v in self.subs.items() if v["expires"] > now}
         out = []
         for sid, v in self.subs.items():
+            # service=None 表示不筛（调试用）；给定值时只取订了该服务的
+            if service is not None and v.get("service") != service:
+                continue
             v["seq"] += 1
             out.append((sid, v["callback"], v["seq"]))
         return out
+
+    @staticmethod
+    def service_name_from_event_url(path):
+        """按 DLNAService.serviceName(fromEventURL:) 建模。"""
+        name = path.replace("/upnp/event/", "")
+        # 只剥结尾数字（AVTransport1 → AVTransport），不剥别的
+        while name and name[-1].isdigit():
+            name = name[:-1]
+        if name in ("AVTransport", "RenderingControl", "ConnectionManager"):
+            return name
+        return "AVTransport"
 
 
 def escape(s: str) -> str:
@@ -270,6 +285,51 @@ def main() -> int:
             re.search(r"guard\s+state\s*!=\s*lastNotifiedState", notify_fn) is not None,
             "没有去重，会把手机端淹掉")
 
+    # ---------- B2. 事件按服务分流 ----------
+    #
+    # 为什么必须单独测这一层：AVTransport 与 RenderingControl 各有自己的
+    # eventSubURL，客户端是**分开订阅**的。把 Volume 事件发给 AVTransport
+    # 的订阅者，严格客户端解析 LastChange 时找不到它要的 TransportState，
+    # 会当成格式错误。三个现象都可能出现（丢掉事件 / 报错 / 直接退订），
+    # 但都不会崩、不会编译失败，只有真连播时才暴露。
+    print("\n[B2] 事件按服务分流（AVTransport / RenderingControl）")
+    ev = read("UnCast/DLNA/EventSubscription.swift")
+
+    c.check("Subscriber 有 service 字段",
+            re.search(r"let\s+service\s*:\s*String", ev) is not None,
+            "Subscriber 没记服务名，无法分流")
+    c.check("notify 接受 service 参数",
+            re.search(r"func\s+notify\s*\([^)]*service\s*:\s*String\?", ev, re.S)
+            is not None,
+            "notify 没有 service 参数，只能广播")
+    c.check("takeTargets 按 service 过滤",
+            re.search(r"sub\.service\s*!=\s*service", ev) is not None,
+            "takeTargets 不按服务过滤 —— Volume 事件会发给 AVTransport 订阅者")
+
+    # 调用侧：AVTransport 与 RenderingControl 必须各自发，不能合成一次广播
+    send_fn = ""
+    mm = re.search(r"private func sendStateEvent\(.*?\n    \}", svc, re.S)
+    if mm:
+        send_fn = mm.group(0)
+    c.check("找到 sendStateEvent 实现", bool(send_fn), "正则未匹配")
+    c.check("状态事件发往 AVTransport 服务",
+            re.search(r'notify\(body:\s*body,\s*service:\s*"AVTransport"', send_fn)
+            is not None,
+            "状态事件没指定 AVTransport")
+    c.check("音量事件发往 RenderingControl 服务",
+            re.search(r'notify\(body:\s*volumeBody,\s*service:\s*"RenderingControl"',
+                      send_fn) is not None,
+            "音量事件没指定 RenderingControl")
+
+    # 订阅侧要按 eventSubURL 解析服务名
+    c.check("subscribe 传入从 URL 解析出的服务名",
+            re.search(r"events\.subscribe\([^)]*service:\s*service", svc, re.S)
+            is not None,
+            "订阅时没记录服务名")
+    c.check("serviceName 从 /upnp/event/ 路径解析",
+            re.search(r"func\s+serviceName\s*\(fromEventURL", svc) is not None,
+            "缺 serviceName(fromEventURL:)")
+
     # ---------- C. 行为 ----------
     print("\n[C] 协议行为：订阅生命周期与事件体")
     s = SubModel()
@@ -339,6 +399,40 @@ def main() -> int:
     except Exception:
         ok2 = False
     c.check("URI 里的 & < > 被正确转义", ok2, "特殊字符破坏 XML")
+
+    # ---- 分流行为：两个服务各自订阅，事件不能串 ----
+    s2 = SubModel()
+    sid_avt = s2.subscribe("http://192.168.1.5:1111/avt", service="AVTransport")
+    sid_rcs = s2.subscribe("http://192.168.1.5:2222/rcs", service="RenderingControl")
+
+    avt_only = s2.take_targets("AVTransport")
+    c.check("按 AVTransport 只取到 1 个（不串入 RenderingControl）",
+            len(avt_only) == 1, f"实际 {len(avt_only)}")
+    c.check("取到的是 AVTransport 那个订阅",
+            len(avt_only) == 1 and avt_only[0][0] == sid_avt,
+            f"实际 {avt_only[0][0] if avt_only else None}")
+
+    rcs_only = s2.take_targets("RenderingControl")
+    c.check("按 RenderingControl 只取到 1 个",
+            len(rcs_only) == 1, f"实际 {len(rcs_only)}")
+    c.check("取到的是 RenderingControl 那个订阅",
+            len(rcs_only) == 1 and rcs_only[0][0] == sid_rcs,
+            f"实际 {rcs_only[0][0] if rcs_only else None}")
+
+    # service=None 是调试用的广播，必须两个都给
+    c.check("service=None 时广播给全部（2 个）",
+            len(s2.take_targets()) == 2, "广播语义丢了")
+
+    # eventSubURL → 服务名
+    for path, want in [
+        ("/upnp/event/AVTransport", "AVTransport"),
+        ("/upnp/event/RenderingControl", "RenderingControl"),
+        ("/upnp/event/AVTransport1", "AVTransport"),      # 带实例号
+        ("/upnp/event/ConnectionManager", "ConnectionManager"),
+        ("/upnp/event/unknown", "AVTransport"),           # 兜底
+    ]:
+        got = SubModel.service_name_from_event_url(path)
+        c.check(f"{path} → {want}", got == want, f"实际 {got}")
 
     return 0 if c.summary() else 1
 
