@@ -71,6 +71,21 @@ struct PlayerView: View {
     @State private var showInspector = false
     @State private var hideTask: Task<Void, Never>?
 
+    /// 焦点丢失的"宽限期"任务。
+    ///
+    /// 进入按钮态的一瞬间焦点必然经历一次 nil（视频锚点刚交权、按钮还没
+    /// 接住），如果把 `focus == nil` 当成"焦点丢了"立刻退回进度条态，
+    /// 结果就是按钮行闪一下就消失。所以改成：观察到 nil 先等一小会，
+    /// 期间焦点回来了就取消；真的起不来才退回。
+    @State private var focusRecoverTask: Task<Void, Never>?
+
+    /// 刚进按钮态的短暂窗口内，忽略"下键收起"。
+    ///
+    /// 触发进入按钮态的那一次物理按下，可能在状态切换后被焦点引擎再派发
+    /// 一次（此时 `level` 已经是 `.buttons`），于是同一次按键既展开又收起。
+    /// 用时间窗挡掉这一次重复派发，不影响之后真正的"下键收起"。
+    @State private var collapseGuardUntil: Date = .distantPast
+
     /// seek 提示（秒，正负表方向），0 表示隐藏
     @State private var seekHint: Int = 0
     @State private var seekHintTask: Task<Void, Never>?
@@ -181,6 +196,9 @@ struct PlayerView: View {
             case .up:
                 withAnimation { level = .progress }
             case .down:
+                // 刚进入按钮态的那一次下键（含被重复派发的那次）不收起，
+                // 否则会出现"按一下展开、同一下又收起"的闪灭。
+                guard Date() >= collapseGuardUntil else { break }
                 withAnimation { level = .hidden }
             default:
                 break
@@ -188,12 +206,16 @@ struct PlayerView: View {
         }
         .onChange(of: level) { newLevel in
             if newLevel == .buttons {
+                // 触发"展开"的那一次下键可能被再派发一次，先挡住
+                collapseGuardUntil = Date().addingTimeInterval(0.45)
                 focusToPlayPause()
                 hideTask?.cancel()
                 hideTask = nil
             } else {
                 // 离开按钮态：释放按钮焦点，焦点自然回到 UIKit 视频锚点
                 if focus != nil { focus = nil }
+                focusRecoverTask?.cancel()
+                focusRecoverTask = nil
                 if newLevel == .progress {
                     restartHide()
                 } else {
@@ -202,12 +224,21 @@ struct PlayerView: View {
                 }
             }
         }
-        // 保险：按钮态里焦点若意外变 nil（焦点引擎找不到下一个目标），
-        // 整个视图树就没有可聚焦元素了 —— 方向键会再次失灵。
-        // 这时退回进度条态，让视频锚点重新接住按键。
+        // 保险：按钮态里焦点若真的起不来（焦点引擎找不到下一个目标），
+        // 整个视图树就没有可聚焦元素了 —— 方向键会再次失灵，所以退回
+        // 进度条态让视频锚点重新接住按键。
+        //
+        // 但不能"一见 nil 就退"：进入按钮态的头几十毫秒焦点本来就短暂为 nil
+        // （锚点已交权、按钮还没接住）。旧实现立刻退回，用户看到的就是
+        // 按钮行闪一下就消失、根本来不及按。
+        // 现在给 450ms 宽限，期间焦点回来了就取消退回。
         .onChange(of: focus) { newFocus in
-            if level == .buttons && newFocus == nil {
-                withAnimation { level = .progress }
+            guard level == .buttons else { return }
+            if newFocus == nil {
+                scheduleFocusRecovery()
+            } else {
+                focusRecoverTask?.cancel()
+                focusRecoverTask = nil
             }
         }
         .onAppear { restartHide() }
@@ -216,6 +247,7 @@ struct PlayerView: View {
             seekHintTask?.cancel()
             // 连按序列的计时器也要收掉，否则视图销毁后闭包仍会醒一次
             seekStreakTask?.cancel()
+            focusRecoverTask?.cancel()
         }
     }
 
@@ -234,6 +266,15 @@ struct PlayerView: View {
             return
         }
 
+        // 按钮态：按键属于焦点引擎（菜单键走 onExitCommand、播放键走
+        // onPlayPauseCommand），UIKit 这条路一律不处理。
+        //
+        // 与 handleMove 里那条 guard 同因：`level` 同步变 .buttons、
+        // 而锚点的 capturesKeys 要等下一次 updateUIView 才落地，
+        // 滞后窗口内这里的播放键/菜单键会被重复处理（暂停被切两次、
+        // 菜单直接把整个播放页退掉）。
+        guard level != .buttons else { return }
+
         switch key {
         case .move(let direction):
             handleMove(direction)
@@ -246,6 +287,18 @@ struct PlayerView: View {
     }
 
     private func handleMove(_ direction: MoveCommandDirection) {
+        // 按钮态的方向键一律交给焦点引擎与 onMoveCommand，这里全部忽略。
+        //
+        // 为什么必须显式挡（这是「按钮行闪一下就连进度条一起消失」的直接原因）：
+        //   `level = .buttons` 是**同步**写入 @State，但
+        //   `uiView.capturesKeys = false` 要等 SwiftUI 下一次 updateUIView
+        //   才真正落到 UIKit 层。这中间有若干毫秒的窗口，视频锚点仍在收键：
+        //   触发展开的那一次下键（或它被焦点引擎重复派发的那一次）会再次
+        //   进到这里，而此时 level 已经是 .buttons。
+        //   旧代码把 `.progress, .buttons` 合并成「上 = 收起」，于是同一次
+        //   按键既展开又收起 —— 用户看到的就是按钮行和进度条一起闪灭。
+        guard level != .buttons else { return }
+
         switch direction {
         case .left:
             seek(-1)
@@ -253,12 +306,14 @@ struct PlayerView: View {
             seek(1)
         case .up:
             // **上下键都能呼出进度条**（用户明确要求）。
-            // 已经在控制层里时，上 = 收起。
+            // 已经在进度条态时，上 = 收起。
             switch level {
             case .hidden:
                 withAnimation { level = .progress }
-            case .progress, .buttons:
+            case .progress:
                 withAnimation { level = .hidden }
+            case .buttons:
+                break   // 已被上面的 guard 挡住；写全只为枚举穷尽
             }
         case .down:
             // 逐级展开：看片态 → 进度条 → 按钮行 → 收起
@@ -268,9 +323,9 @@ struct PlayerView: View {
             case .progress:
                 withAnimation { level = .buttons }
             case .buttons:
-                // 正常到不了：按钮态把按键让给了焦点引擎，
-                // 这里只在焦点意外丢失时兜底。
-                withAnimation { level = .hidden }
+                // 已被上面的 guard 挡住。绝不能在这里收起整个控制层：
+                // 那正是同一次按键被重复派发时的最坏后果。
+                break
             }
         @unknown default:
             break
@@ -692,11 +747,48 @@ struct PlayerView: View {
         restartHide()
     }
 
+    /// 焦点丢失的宽限退回。
+    ///
+    /// 只有"按钮态 + 焦点持续为 nil"才退回进度条态，给 450ms 观察窗：
+    ///  · 进入按钮态的瞬间必然有一次 nil（锚点交权、按钮未接住），属正常过渡；
+    ///  · 期间 `focusToPlayPause` 的某次重试成功 → `onChange(of: focus)`
+    ///    收到非 nil → 取消本任务，不回退；
+    ///  · 真的 450ms 都没起来，说明焦点引擎找不到目标，退回进度条态，
+    ///    让视频锚点重新接住方向键（否则方向键会彻底失灵）。
+    private func scheduleFocusRecovery() {
+        focusRecoverTask?.cancel()
+        focusRecoverTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard !Task.isCancelled else { return }
+            guard level == .buttons, focus == nil, !showInspector else { return }
+            withAnimation { level = .progress }
+        }
+    }
+
+    /// 把焦点落到播放/暂停按钮上。
+    ///
+    /// 旧实现用两次 `DispatchQueue.main.async` 猜时机，问题有两个：
+    ///  1. 猜早了：按钮还没进入可聚焦状态，这次赋值会被焦点引擎弹回 nil，
+    ///     而 `onChange(of: focus)` 把 nil 当作"焦点丢了"，立刻退回进度条态
+    ///     —— 就是"按钮行闪一下就消失"的直接原因。
+    ///  2. 只尝试一次：任何一次弹回都没有第二次机会。
+    ///
+    /// 改成"最多试 4 次、每次间隔 60ms"：
+    ///  · 第一次仍然尽快尝试，保证手感；
+    ///  · 失败就重试，等布局与焦点引擎就绪；
+    ///  · 中途一旦成功（`focus == .playPause`）立刻收手，不反复抢焦点。
     private func focusToPlayPause() {
-        // 等按钮真正上屏后再落焦点，否则按钮还不存在
-        DispatchQueue.main.async {
-            DispatchQueue.main.async {
+        focusRecoverTask?.cancel()
+        focusRecoverTask = nil
+        Task { @MainActor in
+            for attempt in 0..<4 {
+                if attempt > 0 {
+                    try? await Task.sleep(nanoseconds: 60_000_000)
+                }
+                guard !Task.isCancelled else { return }
+                // 用户可能已经按上/返回退出了按钮态，别再把焦点抢回来
                 guard level == .buttons, !showInspector else { return }
+                if focus == .playPause { return }
                 focus = .playPause
             }
         }
@@ -831,12 +923,24 @@ struct VideoLayerView: UIViewRepresentable {
         uiView.capturesKeys = capturesKeys
         uiView.onKey = onKey
 
-        // 从按钮态回到看片/进度条态：让焦点重新落回画面层。
-        // 不主动要一次焦点更新的话，tvOS 可能还停在"没有焦点"的状态上，
-        // 表现为控制层收起了但方向键依然没反应 —— 也就是这次要修的病。
-        if capturesKeys && !wasCapturing {
+        // 两个方向都主动请求一次焦点更新。
+        //
+        // 旧实现只在"回到可捕获"时请求。但反过来（进入按钮态）同样需要：
+        // `canBecomeFocused` 变成 false 之后，焦点引擎不会立刻把焦点从
+        // 这个已不可聚焦的 view 上摘走，它会继续停在那里，直到有人请求
+        // 重新求值 —— 期间 SwiftUI 侧给按钮赋值焦点会被弹回 nil，
+        // 于是按钮行刚出现就因"焦点丢失"被判定失败。
+        //
+        // 用 `setNeedsFocusUpdate()`（下一次求值）而不是
+        // `updateFocusIfNeeded()`（立刻求值）：进入按钮态时按钮可能还没
+        // 完成布局，立刻求值会求到"没有可聚焦目标"，同样落到 nil。
+        if capturesKeys != wasCapturing {
             uiView.setNeedsFocusUpdate()
-            uiView.updateFocusIfNeeded()
+            if capturesKeys {
+                // 回到锚点方向：立即求值。这条路径以前就是好的，
+                // 不立刻求值会出现"控制层收起了但方向键没反应"。
+                uiView.updateFocusIfNeeded()
+            }
         }
     }
 

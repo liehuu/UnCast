@@ -195,16 +195,16 @@ def main() -> int:
         results)
 
     # B2: 上键在隐藏态不呼出。
-    #     同上，`case .progress, .buttons:` 含 ".progress"，
+    #     同上，`case .progress:` 含 ".progress"，
     #     掏空 `.hidden` 那格后子串判断依然是绿的。
     with_patch(
         """            case .hidden:
                 withAnimation { level = .progress }
-            case .progress, .buttons:
+            case .progress:
                 withAnimation { level = .hidden }""",
         """            case .hidden:
                 break
-            case .progress, .buttons:
+            case .progress:
                 withAnimation { level = .hidden }""",
         "B2 上键在隐藏态不呼出进度条",
         "上键在隐藏态也能呼出进度条",
@@ -214,12 +214,14 @@ def main() -> int:
     with_patch(
         """        case .up:
             // **上下键都能呼出进度条**（用户明确要求）。
-            // 已经在控制层里时，上 = 收起。
+            // 已经在进度条态时，上 = 收起。
             switch level {
             case .hidden:
                 withAnimation { level = .progress }
-            case .progress, .buttons:
+            case .progress:
                 withAnimation { level = .hidden }
+            case .buttons:
+                break   // 已被上面的 guard 挡住；写全只为枚举穷尽
             }""",
         """        case .up:
             break""",
@@ -292,12 +294,12 @@ def main() -> int:
 
     # B9: 焦点丢失兜底被删（再次陷入无焦点死区）
     with_patch(
-        """            if level == .buttons && newFocus == nil {
-                withAnimation { level = .progress }
-            }""",
-        """            // 注入：焦点丢失后不兜底""",
+        """            if newFocus == nil {
+                scheduleFocusRecovery()""",
+        """            if newFocus == nil {
+                _ = newFocus""",
         "B9 焦点丢失后不退回进度条态",
-        "焦点意外丢失时退回进度条态",
+        "焦点 nil 时走宽限复核",
         results)
 
     # B10: 切回锚点态不主动要焦点。
@@ -309,19 +311,20 @@ def main() -> int:
     #     反而每帧都要一次，表现是焦点被反复重置、按钮点不动。
     #     专门用来验证第二条断言（跃迁判定）不是装饰。
     with_patch(
-        """        if capturesKeys && !wasCapturing {""",
+        """        if capturesKeys != wasCapturing {""",
         """        if capturesKeys {""",
         "B10 跃迁判定退化成每帧都要焦点",
-        "只在「按钮态 → 锚点态」",
+        "只在 capturesKeys 变化的那一帧要焦点",
         results)
 
     # B10b: 只删焦点请求、保留跃迁判定（不引爆上游断言，只能靠这一条抓）
     with_patch(
-        """            uiView.setNeedsFocusUpdate()
-            uiView.updateFocusIfNeeded()""",
-        """            _ = wasCapturing""",
+        """        if capturesKeys != wasCapturing {
+            uiView.setNeedsFocusUpdate()""",
+        """        if capturesKeys != wasCapturing {
+            _ = wasCapturing""",
         "B10b 只删焦点请求语句",
-        "切回锚点态时主动请求焦点更新",
+        "焦点交接时主动请求焦点更新",
         results)
 
     # B11: 按钮态不放行按键（按钮永远点不动）
@@ -439,13 +442,9 @@ def main() -> int:
     # C8: 按钮态按上不回退（就是用户这次报的第一个问题）
     with_patch(
         """            case .up:
-                withAnimation { level = .progress }
-            case .down:
-                withAnimation { level = .hidden }""",
+                withAnimation { level = .progress }""",
         """            case .up:
-                break
-            case .down:
-                withAnimation { level = .hidden }""",
+                break""",
         "C8 按钮态按上不回进度条（用户报的问题）",
         "按钮态按上退回进度条态",
         results)
@@ -453,12 +452,8 @@ def main() -> int:
     # C9: 上回退写成收起控制层（方向搞反）
     with_patch(
         """            case .up:
-                withAnimation { level = .progress }
-            case .down:
-                withAnimation { level = .hidden }""",
+                withAnimation { level = .progress }""",
         """            case .up:
-                withAnimation { level = .hidden }
-            case .down:
                 withAnimation { level = .hidden }""",
         "C9 上回退写成收起控制层",
         "按钮态按上退回进度条态",
@@ -476,6 +471,64 @@ def main() -> int:
             // 注入：不判断状态""",
         "C10 onMoveCommand 不判断按钮态（双触发）",
         "onMoveCommand 只在按钮态生效",
+        results)
+
+    # C11: 回放 1.0.3 的真实缺陷 —— 上键把 .buttons 也当"收起"。
+    #      表现：进度条态按下键展开按钮行，同一次按键又被 UIKit 路径按
+    #      「上/下=收起」处理，按钮行连进度条一起闪灭（用户 2026-11-18 回报）。
+    #      注入时保留 .progress 分支不动，只让 .buttons 分支也收起 ——
+    #      否则会先引爆「上键在进度条态收起」，测不到目标断言。
+    with_patch(
+        """            case .progress:
+                withAnimation { level = .hidden }
+            case .buttons:
+                break   // 已被上面的 guard 挡住；写全只为枚举穷尽""",
+        """            case .progress:
+                withAnimation { level = .hidden }
+            case .buttons:
+                withAnimation { level = .hidden }""",
+        "C11 回放 1.0.3（上键把按钮态也当收起）",
+        "上键在按钮态不由 UIKit 路径收起",
+        results)
+
+    # C12: 删掉 handleMove 顶部的按钮态 guard —— 滞后窗口内会重处理按键。
+    #      锚点必须带上一行注释：handleKey 里有**一模一样**的 guard 行，
+    #      不带上文会改错地方。
+    with_patch(
+        """        //   按键既展开又收起 —— 用户看到的就是按钮行和进度条一起闪灭。
+        guard level != .buttons else { return }""",
+        """        //   按键既展开又收起 —— 用户看到的就是按钮行和进度条一起闪灭。
+        //   注入：guard 被删""",
+        "C12 handleMove 去掉按钮态整体让位",
+        "handleMove 在按钮态整体让位",
+        results)
+
+    # C13: 删掉 handleKey 的按钮态 guard（播放键双触发 / 菜单键直接退出）
+    with_patch(
+        """        // 菜单直接把整个播放页退掉）。
+        guard level != .buttons else { return }""",
+        """        // 菜单直接把整个播放页退掉）。
+        // 注入：guard 被删""",
+        "C13 handleKey 去掉按钮态整体让位",
+        "handleKey 在按钮态整体让位",
+        results)
+
+    # C14: onChange(of: focus) 变回"一见 nil 就退回"
+    with_patch(
+        """            if newFocus == nil {
+                scheduleFocusRecovery()""",
+        """            if newFocus == nil {
+                withAnimation { level = .progress }""",
+        "C14 焦点 nil 立刻退回（按钮行闪灭的旧实现）",
+        "焦点 nil 时走宽限复核",
+        results)
+
+    # C15: 去掉下键的防重复派发窗口
+    with_patch(
+        """                guard Date() >= collapseGuardUntil else { break }""",
+        """                // 注入：无防护窗""",
+        "C15 下键收起无防护窗（同一次按键既展开又收起）",
+        "下键收起带防重复派发窗口",
         results)
 
     print()

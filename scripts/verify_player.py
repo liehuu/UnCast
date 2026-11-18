@@ -366,9 +366,15 @@ def main() -> int:
             c.check("level = .progress" in u_arms.get(".hidden", ""),
                     "上键在隐藏态也能呼出进度条",
                     u_arms.get(".hidden", "").strip()[:60])
-            c.check("level = .hidden" in u_arms.get(".progress, .buttons", ""),
-                    "上键在控制层里时收起",
-                    u_arms.get(".progress, .buttons", "").strip()[:60])
+            # 只有进度条态才由 UIKit 这条路收起；按钮态已由
+            # handleMove 顶部的 guard 整体挡掉（收起走 onMoveCommand），
+            # 所以这里**不能**再要求 `.progress, .buttons` 合并分支。
+            c.check("level = .hidden" in u_arms.get(".progress", ""),
+                    "上键在进度条态收起",
+                    u_arms.get(".progress", "").strip()[:60])
+            c.check("level = .hidden" not in u_arms.get(".buttons", ""),
+                    "上键在按钮态不由 UIKit 路径收起（避免同一次按键双处理）",
+                    u_arms.get(".buttons", "").strip()[:60])
 
     # ─────────────────────────── 3.5 连按累进 seek
     print("\n== 3.5 左右键连按累进（15s → 1min → 5min）==")
@@ -471,6 +477,31 @@ def main() -> int:
                 "按钮态按下收起整个控制层",
                 mc_arms.get(".down", "").strip()[:60])
 
+        # 「下键收起」必须带防重派发窗口。
+        #
+        # 触发进入按钮态的那一次物理按下，可能在状态切换后被焦点引擎
+        # 再派发一次；此时 level 已是 .buttons，同一次按键就既展开又收起，
+        # 用户看到的是按钮行闪灭。加时间窗挡掉这一次。
+        c.check("collapseGuardUntil" in mc_arms.get(".down", ""),
+                "下键收起带防重复派发窗口（同一次按键不会既展开又收起）",
+                mc_arms.get(".down", "").strip()[:80])
+
+    # handleMove 必须在按钮态整体不动作。
+    #
+    # 这是「按钮行连进度条一起闪灭」的根因所在：`level = .buttons` 同步
+    # 写 @State，但锚点的 `capturesKeys = false` 要等下一次 updateUIView
+    # 才落地；滞后窗口内同一次下键又被送进 handleMove，而旧代码把
+    # `.progress, .buttons` 合并成「上 = 收起」，于是按一下就展开又收起。
+    hm = body_of(src, "private func handleMove")
+    c.check(bool(hm), "handleMove 存在")
+    if hm:
+        c.check(re.search(r"guard\s+level\s*!=\s*\.buttons\s+else\s*\{\s*return\s*\}",
+                          hm) is not None,
+                "handleMove 在按钮态整体让位（不处理任何方向键）")
+        # 兜底分支也不许收起整个控制层
+        c.check(len(re.findall(r"level\s*=\s*\.hidden", hm)) <= 1,
+                "handleMove 里至多一处收起（仅进度条态），按钮态不收起")
+
     # ─────────────────────────── 4. 控制层可恢复性
     print("\n== 4. 控制层隐藏后必须可恢复 ==")
 
@@ -489,13 +520,45 @@ def main() -> int:
         c.check("focus" in restart,
                 "自动隐藏前检查按钮焦点（用户正在选按钮时不隐藏）")
 
-    # 焦点意外丢失时必须有兜底：退回进度条态，让锚点重新接住按键
-    c.check(re.search(
-        r"\.onChange\(of:\s*focus\)[\s\S]{0,300}?level\s*=\s*\.progress", src)
-        is not None,
-        "焦点意外丢失时退回进度条态（防止再次陷入无焦点死区）")
+    # 按钮态按键属于焦点引擎（返回走 onExitCommand、播放键走
+    # onPlayPauseCommand），UIKit 入口必须整体让位，否则滞后窗口内
+    # 播放键会被切两次、菜单键会直接退掉整个播放页。
+    hk = body_of(src, "private func handleKey")
+    c.check(bool(hk), "handleKey 存在")
+    if hk:
+        c.check(re.search(r"guard\s+level\s*!=\s*\.buttons\s+else\s*\{\s*return\s*\}",
+                          hk) is not None,
+                "handleKey 在按钮态整体让位（不与焦点引擎双触发）")
 
-    # 从按钮态回到锚点态时必须主动要焦点。
+    # 焦点意外丢失时必须有兜底：退回进度条态，让锚点重新接住按键。
+    #
+    # 但**不能**一见到 nil 就退。进入按钮态的瞬间焦点必然短暂为 nil
+    # （视频锚点已交权、按钮还没接住），旧实现立刻退回，表现就是
+    # 「按一下下键，按钮行闪一下就消失」。真实反馈见 2026-11-18 用户回报。
+    # 所以判据改成两段：
+    #   1. onChange(of: focus) 里走的是「延迟复核」函数，不是直接改 level
+    #   2. 该函数里才有 level = .progress，且带 sleep 宽限
+    foc_cb = body_of(src, ".onChange(of: focus)")
+    c.check(bool(foc_cb), "存在 onChange(of: focus) 分支")
+    if foc_cb:
+        c.check("scheduleFocusRecovery" in foc_cb,
+                "焦点 nil 时走宽限复核（而不是立刻退回）",
+                foc_cb.strip()[:80])
+        c.check("level = .progress" not in foc_cb,
+                "onChange(of: focus) 里不直接改 level（避免按钮行闪灭）")
+
+    rec = body_of(src, "func scheduleFocusRecovery")
+    c.check(bool(rec), "scheduleFocusRecovery 存在")
+    if rec:
+        c.check("Task.sleep" in rec,
+                "退回前有宽限等待（给按钮接住焦点的时间）")
+        c.check("level = .progress" in rec,
+                "宽限到期且仍无焦点才退回进度条态")
+        c.check(re.search(r"focus\s*==\s*nil", rec) is not None,
+                "退回前复核焦点仍为 nil（期间恢复则放弃退回）")
+
+    # 从按钮态回到锚点态时必须主动要焦点；进入按钮态时同样要请求，
+    # 否则锚点已不可聚焦但焦点还挂在它身上，按钮的赋值会被弹回 nil。
     #
     # 判据必须钉在 updateUIView 里那一处：PlayerContainerView
     # 的 didMoveToWindow 里也有一次 setNeedsFocusUpdate（首次上屏用），
@@ -505,10 +568,13 @@ def main() -> int:
     c.check(bool(upd), "updateUIView 存在")
     if upd:
         c.check("setNeedsFocusUpdate" in upd,
-                "切回锚点态时主动请求焦点更新",
+                "焦点交接时主动请求焦点更新",
                 upd.strip()[:80])
-        c.check(re.search(r"capturesKeys\s*&&\s*!\s*wasCapturing", upd) is not None,
-                "只在「按钮态 → 锚点态」这一跃迁上要焦点（不是每帧都要）")
+        c.check(re.search(r"capturesKeys\s*!=\s*wasCapturing", upd) is not None,
+                "只在 capturesKeys 变化的那一帧要焦点（不是每帧都要）")
+        c.check(re.search(r"if\s+capturesKeys\s*\{[\s\S]{0,160}?updateFocusIfNeeded",
+                          upd) is not None,
+                "回到锚点态时立即求值（保证方向键马上有落点）")
 
     # ─────────────────────────── 5. 点按手势不能抢按键
     print("\n== 5. 点按手势只允许在看片态启用 ==")
