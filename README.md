@@ -35,23 +35,26 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 
 ### 已构建好的包
 
-仓库 `dist/UnCast-1.0.2.tipa` 就是可直接安装的成品（由 GitHub Actions 构建）。
+仓库 `dist/UnCast-1.0.3.tipa` 就是可直接安装的成品（由 GitHub Actions 构建）。
 
 | 项 | 值 |
 |---|---|
-| 版本 | 1.0.2（build 3） |
-| 大小 | 3,670,491 字节（3.50 MB） |
-| sha256 | `9b4f2ec61cf3cf314a73d34e52e38b0a155a0b5d11d3325fa522742277939449` |
+| 版本 | 1.0.3（build 4） |
+| 大小 | 3,690,119 字节（3.52 MB） |
+| sha256 | `63a16587fb7cabf0ac0019a31fbceeba5cdd584da4043cd2bef954bc23c96cda` |
 | 架构 | arm64 |
 | 平台 | tvOS（`LC_BUILD_VERSION.platform = 3`，minos 15.0） |
 | 加密 | 未加密（`cryptid = 0`） |
 | 签名 | ad-hoc（含 `LC_CODE_SIGNATURE`，dataSize > 0） |
 | 多播权限 | `com.apple.developer.networking.multicast = true` |
 | 主屏图标 | 内置，橘黄渐变主题（`Assets.car` 3.17 MB，9 条 rendition） |
-| 构建 | GitHub Actions run #44218903561（`cc2c6ef`），18 步全绿 |
+| 构建 | GitHub Actions run #44242699883（`162d1fe`），18 步全绿 |
 
 上述指标是读 tipa 内二进制的原始字节实测得出，可用
 `python3 scripts/check_tipa.py <tipa>` 自行复现（16 项断言）。
+
+**1.0.3 补的是连播链路**：GENA 事件订阅（手机端能收到「这集播完了」）、
+`SetNextAVTransportURI` 不再打断当前播放。详见下文「播完能不能自动接下一集」。
 
 **1.0.2 改的是遥控器手感**：按钮行按 ↑ 退回进度条；左右键连按累进
 （1 次 15 秒 → 2 次 1 分钟 → 3 次 5 分钟）。完整说明见下文「遥控器交互」。
@@ -97,9 +100,9 @@ python3 scripts/check_icon.py .            # 34 项校验
 
 ### TrollStore 安装步骤
 
-1. 把 `UnCast-1.0.2.tipa` 传到 iPhone / iPad，或用「文件」App 存到 iCloud Drive
+1. 把 `UnCast-1.0.3.tipa` 传到 iPhone / iPad，或用「文件」App 存到 iCloud Drive
 2. 在 Apple TV 上打开 TrollStore → **Install from File**（或通过 Filza / 局域网上传）
-3. 选中 `UnCast-1.0.2.tipa` → 安装
+3. 选中 `UnCast-1.0.3.tipa` → 安装
 4. 首次启动会询问「本地网络」权限，**必须允许**，否则收不到投屏
 
 > 为什么不用 App Store 的 ipa：App Store 下发的 tvOS 二进制带 FairPlay 加密
@@ -705,9 +708,9 @@ resp.headers["SID"] = "uuid:\(uuid)-event"
 
 ```bash
 python3 scripts/verify_gena.py            # 37 条：SCPD 声明 / 源码接线 / 订阅行为
-python3 scripts/selftest_gena_red.py      # 6 项注入，证明上面那些断言真会红
+python3 scripts/selftest_gena_red.py      # 13 条反向验证（6 项注入），证明上面那些断言真会红
 python3 scripts/verify_setnext.py         # 13 条：预载不得打断当前播放
-python3 scripts/selftest_setnext_red.py   # 反向：换回旧实现必须变红
+python3 scripts/selftest_setnext_red.py   # 6 条反向：换回旧实现必须变红
 ```
 
 一个提醒：**播完停住不一定是本应用的问题**。如果手机 App 压根没订阅事件、
