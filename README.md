@@ -33,26 +33,26 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 
 ### 已构建好的包
 
-仓库 `dist/UnCast-1.0.1.tipa` 就是可直接安装的成品（由 GitHub Actions 构建）。
+仓库 `dist/UnCast-1.0.2.tipa` 就是可直接安装的成品（由 GitHub Actions 构建）。
 
 | 项 | 值 |
 |---|---|
-| 版本 | 1.0.1（build 2） |
-| 大小 | 3,667,587 字节（3.50 MB） |
-| sha256 | `83e1bfb422a58299bc28e44e52f21615157a21d909830004c3a562a0274c9566` |
+| 版本 | 1.0.2（build 3） |
+| 大小 | 3,670,491 字节（3.50 MB） |
+| sha256 | `9b4f2ec61cf3cf314a73d34e52e38b0a155a0b5d11d3325fa522742277939449` |
 | 架构 | arm64 |
 | 平台 | tvOS（`LC_BUILD_VERSION.platform = 3`，minos 15.0） |
 | 加密 | 未加密（`cryptid = 0`） |
 | 签名 | ad-hoc（含 `LC_CODE_SIGNATURE`，dataSize > 0） |
 | 多播权限 | `com.apple.developer.networking.multicast = true` |
 | 主屏图标 | 内置，橘黄渐变主题（`Assets.car` 3.17 MB，9 条 rendition） |
-| 构建 | GitHub Actions run #44216056335（`df995044`），18 步全绿 |
+| 构建 | GitHub Actions run #44218903561（`cc2c6ef`），18 步全绿 |
 
 上述指标是读 tipa 内二进制的原始字节实测得出，可用
 `python3 scripts/check_tipa.py <tipa>` 自行复现（16 项断言）。
 
-**1.0.1 修的是遥控器交互**：方向键上下呼出进度条、进度条下左右快进/快退、
-进度条下再按下键展开按钮行。完整说明见下文「遥控器交互」。
+**1.0.2 改的是遥控器手感**：按钮行按 ↑ 退回进度条；左右键连按累进
+（1 次 15 秒 → 2 次 1 分钟 → 3 次 5 分钟）。完整说明见下文「遥控器交互」。
 
 > 直接从 1.0.0 覆盖安装即可，不需要先卸载 —— bundle id 未变，
 > 设置与播放记录都会保留。
@@ -95,9 +95,9 @@ python3 scripts/check_icon.py .            # 34 项校验
 
 ### TrollStore 安装步骤
 
-1. 把 `UnCast-1.0.0.tipa` 传到 iPhone / iPad，或用「文件」App 存到 iCloud Drive
+1. 把 `UnCast-1.0.2.tipa` 传到 iPhone / iPad，或用「文件」App 存到 iCloud Drive
 2. 在 Apple TV 上打开 TrollStore → **Install from File**（或通过 Filza / 局域网上传）
-3. 选中 `UnCast-1.0.1.tipa` → 安装
+3. 选中 `UnCast-1.0.2.tipa` → 安装
 4. 首次启动会询问「本地网络」权限，**必须允许**，否则收不到投屏
 
 > 为什么不用 App Store 的 ipa：App Store 下发的 tvOS 二进制带 FairPlay 加密
@@ -178,7 +178,7 @@ python3 scripts/verify_injection.py # 反向注入，证明断言能失败
 
 ---
 
-## 遥控器交互（分级控制层 · v1.0.1 重做）
+## 遥控器交互（分级控制层 · v1.0.2）
 
 v1.0.0 交付后实测报了两个症状，看起来是两件事，其实是**同一个根因**：
 
@@ -314,8 +314,8 @@ if capturesKeys && !wasCapturing {
 
 ### 为什么这一版值得信
 
-`scripts/verify_player.py` 有 **55 条**断言，`scripts/verify_player_injection.py`
-逐条注入破坏（**25 项变异 + 1 项 plist 格式**），确认每条断言真的能失败。
+`scripts/verify_player.py` 有 **80 条**断言，`scripts/verify_player_injection.py`
+逐条注入破坏（**34 项变异 + 1 项 plist 格式**），确认每条断言真的能失败。
 其中 4 条是 v1.0.0 那批「假 PASS」的教训：
 
 | 变异 | 旧断言为什么抓不住 | 新判据 |
@@ -324,6 +324,18 @@ if capturesKeys && !wasCapturing {
 | 下键不展开按钮层 | 查 `".buttons" in down_body`，`case .buttons:` **标签本身**就命中 | 按花括号深度切出 `.progress` 那一格再找赋值 |
 | 上键隐藏态不呼出 | 同上，`case .progress, .buttons:` 含 `.progress` | 精确切到 `.hidden` 那一格 |
 | 切回锚点态不请求焦点 | 查全文有无 `setNeedsFocusUpdate`，`didMoveToWindow` 里还有一处 | 只在 `updateUIView` 函数体内找 |
+
+v1.0.2 加连按累进时又踩了同一类坑（**新写的断言自己就是假 PASS**）：
+
+| 变异 | 旧断言为什么抓不住 | 新判据 |
+|---|---|---|
+| 不记连按序列起点（C3） | 查 `"seekAnchor" in seekfn`，注入删掉赋值后变量名仍在 `seekAnchor ?? …` 里 | `re.search(r"seekAnchor\s*=\s*engine\.currentTime")` |
+| 换方向不重新起算（C4） | 查 `"seekSign" in seekfn and "seekStreak" in seekfn`，`seekSign = dir` 那行仍在 | `re.search(r"seekSign\s*==\s*dir")`，钉在判断动作上 |
+| 超时后不复位（C5） | 查 `rf"{var}\s*="`，注入的 `_ = seekStreak` 就能满足 | 精确匹配 `= 0\b` / `= nil\b` |
+| `onMoveCommand` 不判按钮态（C10） | —— 不是断言问题，是**注入锚点**打错：`guard level == .buttons else { return }` 在源码出现 2 次，`replace(…, 1)` 命中了 `onPlayPauseCommand` 那一处 | 锚点带上文 `.onMoveCommand { direction in\n` |
+
+教训收敛成一句：**判据要钉在「赋值 / 判断」这个动作上，不能钉在变量名上**。
+变量名在删除动作后往往还留在别处，子串照样命中，变异测试就成了装饰。
 
 一次 `python3 scripts/verify_player.py && python3 scripts/verify_player_injection.py`
 就能复现全部结论。
@@ -706,10 +718,14 @@ UnCast/
 │   ├── icon_themes_preview.py     # 四套配色对比图，换色先看图再决定
 │   ├── check_tipa.py              # 产物门禁：平台/加密/签名/多播权限
 │   ├── check_icon.py              # 图标门禁：源资源 + 包内 Assets.car
-│   ├── verify_player.py           # 播放器交互契约（36 项）
+│   ├── check_tvos_api.py          # tvOS API 黑名单（编译前拦住 iOS 写法）
+│   ├── verify_player.py           # 播放器交互契约（80 项）
 │   ├── verify_player_injection.py # 变异测试：证明上面那些断言真会红
+│   ├── selftest_seek_streak.py     # 连按累进的行为级自测（复刻状态机跑按键序列）
 │   ├── selftest_icon_paths.py     # check_icon 两条代码路径都跑一遍
 │   ├── selftest_tipa.py           # check_tipa 的合成产物回归（不需要 Xcode）
+│   ├── selftest_check_tvos_api.py # tvOS 规则的反向验证（注入真实报错原文）
+│   ├── ci.py                      # 查运行 / 看步骤 / 解日志 zip / 下载产物
 │   └── push_tree.py               # 用 Git Data API 推送（本机 git push 被代理挡）
 └── UnCast/
     ├── App/
