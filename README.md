@@ -47,14 +47,14 @@ https://github.com/liehuu/UnCast/releases/download/v1.0.3/UnCast-1.0.3.tipa
 |---|---|
 | 版本 | 1.0.3（build 4） |
 | 大小 | 3,690,119 字节（3.52 MB） |
-| sha256 | `63a16587fb7cabf0ac0019a31fbceeba5cdd584da4043cd2bef954bc23c96cda` |
+| sha256 | `ae83627237ea2acab08c2ad7c9911384f8a9a3e07320c31ca43605bfd7e51c7a` |
 | 架构 | arm64 |
 | 平台 | tvOS（`LC_BUILD_VERSION.platform = 3`，minos 15.0） |
 | 加密 | 未加密（`cryptid = 0`） |
 | 签名 | ad-hoc（含 `LC_CODE_SIGNATURE`，dataSize > 0） |
 | 多播权限 | `com.apple.developer.networking.multicast = true` |
 | 主屏图标 | 内置，橘黄渐变主题（`Assets.car` 3.17 MB，9 条 rendition） |
-| 构建 | GitHub Actions run #44242699883（`162d1fe`），18 步全绿 |
+| 构建 | GitHub Actions run #44245481733（`49bdc31`），18 步全绿 |
 
 上述指标是读 tipa 内二进制的原始字节实测得出，可用
 `python3 scripts/check_tipa.py <tipa>` 自行复现（16 项断言）。
