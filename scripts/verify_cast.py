@@ -15,6 +15,7 @@
 用法: python verify_cast.py --selftest
 """
 import json
+import os
 import re
 import sys
 
@@ -295,6 +296,52 @@ def validate_ssdp_and_http():
                  .replace("&quot;", '"').replace("&amp;", "&"))
     c.check("unescape 后能取到标题", title_from_didl(unescaped) == "我的影片",
             f"实际 {title_from_didl(unescaped)}")
+
+    print("\n[用例 11] 源码接线：SetNext 必须调 appendToQueue，不能调 castPlaylist")
+    # 为什么静态断言还要单独看源码：上面所有用例跑的是 Python 复刻模型，
+    # 它证明的是「契约该长这样」，证明不了「Swift 真的这么写了」。
+    # 这两条把它们接起来 —— 模型与源码必须同时对上，缺一条结论就不成立。
+    svc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "UnCast", "DLNA", "DLNAService.swift")
+    eng_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "UnCast", "Player", "PlaybackEngine.swift")
+    try:
+        svc_src = open(svc_path, encoding="utf-8").read()
+        eng_src = open(eng_path, encoding="utf-8").read()
+    except OSError as e:
+        c.check("能读到 DLNAService.swift", False, str(e))
+        return c.summary()
+
+    # 切出 SetNextAVTransportURI 那个 case 分支的正文
+    m = re.search(r'case\s+"SetNextAVTransportURI"\s*:(.*?)(?=\n\s*case\s+")',
+                  svc_src, re.S)
+    branch = m.group(1) if m else ""
+    c.check("找到 SetNextAVTransportURI 分支", bool(branch), "正则为空")
+
+    # 判据钉在「调用动作」上：castPlaylist 的调用形态必须消失。
+    # 不能只查 "castPlaylist" 子串 —— 注释里还留着解释为什么不用它，
+    # 子串会被注释命中，那就会变成永远为绿的假断言。
+    c.check("分支内不再调用 engine.castPlaylist(…startAt:)",
+            re.search(r"engine\s*\.\s*castPlaylist\s*\(", branch) is None,
+            "仍在调用 castPlaylist")
+    c.check("分支内调用 engine.appendToQueue(…)",
+            re.search(r"engine\s*\.\s*appendToQueue\s*\(", branch) is not None,
+            "没找到 appendToQueue 调用")
+    c.check("appendToQueue 首参是 url:",
+            re.search(r"engine\s*\.\s*appendToQueue\s*\(\s*url\s*:", branch) is not None,
+            "参数标签不对")
+
+    # 引擎侧：appendToQueue 内部绝不能出现 loadAndPlay
+    m2 = re.search(r"func\s+appendToQueue\s*\([^)]*\)[^{]*\{(.*?)\n    \}",
+                   eng_src, re.S)
+    append_body = m2.group(1) if m2 else ""
+    c.check("找到 appendToQueue 定义", bool(append_body), "正则没匹配到")
+    c.check("appendToQueue 内不调用 loadAndPlay",
+            "loadAndPlay" not in append_body,
+            f"正文: {append_body[:80]}")
+    c.check("appendToQueue 不修改 currentIndex",
+            "currentIndex" not in append_body,
+            f"正文: {append_body[:80]}")
 
     return c.summary()
 

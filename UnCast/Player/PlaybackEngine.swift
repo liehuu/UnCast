@@ -169,6 +169,22 @@ final class PlaybackEngine: ObservableObject {
         loadAndPlay(index: currentIndex)
     }
 
+    /// 把一条媒体排到队列末尾，**不打断当前播放**。
+    ///
+    /// 为什么必须单独开一个方法，而不是复用 `castPlaylist`：
+    /// `castPlaylist` 内部无条件 `loadAndPlay(currentIndex)`，会把当前这一集
+    /// 从头重新加载。而 DLNA 的 `SetNextAVTransportURI` 语义是「排下一集」，
+    /// 不该动播放位置。走过去会出现：用户播到 20 分钟，手机预载第 2 集，
+    /// 画面直接跳回 0:00 —— `scripts/verify_setnext.py` 第 2 组测的就是这个。
+    ///
+    /// 队列为空时（手机先发 Next 后发 URI 的少见顺序）只入队不播放，
+    /// 等后续 `Play` 或 `SetAVTransportURI` 再决定放什么。
+    func appendToQueue(url: URL, title: String? = nil) {
+        let item = MediaItem(title: title ?? Self.guessTitle(from: url), url: url)
+        guard !playlist.contains(item) else { return }
+        playlist.append(item)
+    }
+
     func play() {
         // 没有当前 item 但有列表时，从当前索引重新加载
         if player.currentItem == nil {
@@ -345,6 +361,15 @@ final class PlaybackEngine: ObservableObject {
         return [-1001, -1005, -1009, -1004].contains(error.code)
     }
 
+    /// 播放结束时的回调（一次播放到底，不含用户 Stop）。
+    ///
+    /// 为什么单独开这个口子，而不是让 DLNAService 去轮询 state：
+    /// 手机端的连播逻辑是「收到 STOPPED 事件 → 推下一集」，
+    /// 这个事件必须是**播完那一刻**发出的。轮询会晚 0.5 秒，
+    /// 而且单集模式下 `state` 本来就是 `.stopped`，
+    /// 轮询看到的「没变化」会让事件永远发不出去。
+    var onPlaybackFinished: (() -> Void)?
+
     private func handlePlaybackEnd() {
         switch playMode {
         case .repeatOne:
@@ -372,6 +397,10 @@ final class PlaybackEngine: ObservableObject {
                 currentTime = 0
             }
         }
+        // 播到底之后通知外部（DLNAService 用它发 GENA 事件）。
+        // 位置在 switch 之后：不管哪种模式，手机端都该知道「这一集过去了」——
+        // repeatAll 收到的是新集的 PLAYING + 新 URI，normal 收到的是 STOPPED。
+        onPlaybackFinished?()
     }
 
     // MARK: - 观测

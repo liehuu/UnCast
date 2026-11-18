@@ -162,8 +162,13 @@ enum UPnPDescription {
         </action>
       </actionList>
       <serviceStateTable>
+        <!-- LastChange：UPnP AV 规定本服务所有状态都通过它一次性带出去。
+             它必须是 sendEvents="yes"，否则等于对外声明「本设备不产生任何事件」，
+             手机端就不会订阅，也就永远收不到「播完了」，连播不成立。
+             旧版本这里全是 sendEvents="no" 且没有 LastChange，是连播失败的根因之一。 -->
+        <stateVariable sendEvents="yes"><name>LastChange</name><dataType>string</dataType></stateVariable>
         <stateVariable sendEvents="no"><name>TransportState</name><dataType>string</dataType>
-          <allowedValueList><allowedValue>STOPPED</allowedValue><allowedValue>PLAYING</allowedValue><allowedValue>PAUSED_PLAYBACK</allowedValue><allowedValue>TRANSITIONING</allowedValue></allowedValueList>
+          <allowedValueList><allowedValue>STOPPED</allowedValue><allowedValue>PLAYING</allowedValue><allowedValue>PAUSED_PLAYBACK</allowedValue><allowedValue>TRANSITIONING</allowedValue><allowedValue>NO_MEDIA_PRESENT</allowedValue></allowedValueList>
         </stateVariable>
         <stateVariable sendEvents="no"><name>TransportStatus</name><dataType>string</dataType>
           <allowedValueList><allowedValue>OK</allowedValue><allowedValue>ERROR_OCCURRED</allowedValue></allowedValueList>
@@ -238,6 +243,8 @@ enum UPnPDescription {
         </action>
       </actionList>
       <serviceStateTable>
+        <!-- 同 AVTransport：Volume/Mute 通过 LastChange 派发，必须 sendEvents="yes" -->
+        <stateVariable sendEvents="yes"><name>LastChange</name><dataType>string</dataType></stateVariable>
         <stateVariable sendEvents="no"><name>Volume</name><dataType>ui2</dataType><allowedValueRange><minimum>0</minimum><maximum>100</maximum><step>1</step></allowedValueRange></stateVariable>
         <stateVariable sendEvents="no"><name>Mute</name><dataType>boolean</dataType></stateVariable>
         <stateVariable sendEvents="no"><name>A_ARG_TYPE_InstanceID</name><dataType>ui4</dataType></stateVariable>

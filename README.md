@@ -14,7 +14,9 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 | DLNA 投屏接收 | ✅ | SSDP 发现 + AVTransport/RenderingControl/ConnectionManager 三服务 |
 | 播放器 | ✅ | 原生 AVPlayer，支持 HDR / Dolby Vision（取决于片源与 tvOS 设置） |
 | 播放列表 | ✅ | 列表循环 / 单集循环 / 顺序 / 随机 |
-| 进度控制 | ✅ | 遥控器左右滑动 ±15 秒，进度条显示 |
+| GENA 事件推送 | ✅ | v1.0.3 补齐：`LastChange` + 真订阅 + 播完通知（见「播完能不能自动接下一集」） |
+| 预载下一集 | ✅ | `SetNextAVTransportURI` 只入队，不打断当前播放 |
+| 进度控制 | ✅ | 左右连按累进：15 秒 → 1 分钟 → 5 分钟 |
 | 音量控制 | ✅ | RenderingControl SetVolume，界面同步 |
 | 检查器 | ✅ | 上滑呼出，显示状态/时长/分辨率/协议 |
 | HTTP 投屏 API | ✅ | 完全兼容 UnPlay 的 `POST /` 与 `GET /PlaybackEvent` |
@@ -621,6 +623,99 @@ urls=<URL编码的"标题$地址"列表>&option=native&mode=playList
 
 ---
 
+## 播完能不能自动接下一集
+
+这是被问得最多的问题之一，答案取决于**你用哪条路投屏**，两条路的机制完全不同。
+
+### 先说结论
+
+| 投屏方式 | 自动连播 | 依赖什么 |
+|---|---|---|
+| 网页端推送列表（`http://电视IP:9030/`） | ✅ 能 | `mode=playList`，列表在电视侧，本机自己切集 |
+| 手机 App 的 DLNA 单集投屏 | ⚠️ 看 App | 手机端得发 `SetNextAVTransportURI`，或订阅事件后自己推下一集 |
+| AirPlay | ❌ 不适用 | 走 tvOS 系统接收端，与本应用无关 |
+
+### 网页端推送列表（一定行）
+
+打开 `http://电视IP:9030/`，每行一条 `标题$地址`，模式选「列表循环」：
+
+```
+第1集$http://cdn/ep01.m3u8
+第2集$http://cdn/ep02.m3u8
+第3集$http://cdn/ep03.m3u8
+```
+
+播放列表在电视侧，播完一集由本机自己 `loadAndPlay` 下一集，不依赖手机。
+这跟 UnPlay 的 `mode=playList` 是同一套机制，接口也一致。
+
+### 手机 DLNA 投屏（取决于 App 怎么做）
+
+`SetAVTransportURI` 协议上只带**一条** URI，没有「列表」这个概念。
+手机投第一集时，电视只收到一个地址，不可能凭空知道后面还有第二集。
+要接上，手机端必须做下面两件事之一：
+
+1. **预载**：投第一集后再发一个 `SetNextAVTransportURI`，把第二集排进队列
+2. **订阅事件**：`SUBSCRIBE` 我们的事件，收到 `TransportState=STOPPED`
+   后自己发 `SetAVTransportURI`(第二集)
+
+第 2 条是主流做法。**v1.0.3 修的就是这条路**——之前的实现三处同时断，
+任何一处断了结果都一样：播完停住，得回手机重新投。
+
+### v1.0.3 修的三处（都能编译、都能播第一集，只在连播时暴露）
+
+**① SCPD 声明成「不产生事件」**
+
+所有 `stateVariable` 都写着 `sendEvents="no"`，也没有 `LastChange` 变量。
+按 UPnP 规范，这等于对外声明**本设备不产生任何事件**——严格客户端看到
+这个声明直接就不订阅了。现在 AVTransport 与 RenderingControl 都补上了
+`sendEvents="yes"` 的 `LastChange`。
+
+**② SUBSCRIBE 回了一个编造的 SID**
+
+```swift
+// 旧写法：回 200 + 假 SID，然后什么都不发
+resp.headers["SID"] = "uuid:\(uuid)-event"
+```
+
+客户端以为自己订上了，然后永远等不到通知。现在走真正的订阅表：
+新订阅返回真 SID 并**立刻推一次当前状态**（规范要求客户端要有基线），
+续订带 SID 走续订，未知 SID 回 412 让客户端重新订阅。
+
+**③ 播完时零通知**
+
+`AVPlayerItemDidPlayToEndTime` 触发后只改了内部 `state`，没有任何对外信号。
+现在 `handlePlaybackEnd` 末尾调 `onPlaybackFinished`，由 `DLNAService`
+发一条 `LastChange` 事件出去。
+
+事件推送按**状态是否真的变了**去重——不去重的话，0.5 秒一次的进度回调
+会把 NOTIFY 刷成洪水，手机端反而处理不过来。
+
+### 顺手修的一个 bug：预载下一集会打断当前播放
+
+`SetNextAVTransportURI` 以前调的是 `castPlaylist(_:mode:startAt:)`，
+而它内部**无条件** `loadAndPlay(currentIndex)`。后果很具体：
+
+> 播到 20 分钟，手机端预载下一集 → 画面直接跳回 0:00。
+
+现在改成 `appendToQueue(url:title:)`，只入队、不碰当前播放位置。
+`scripts/verify_setnext.py` 第 2 组专门测这个（断言盯着
+`loadAndPlay` 的调用次数，不是盯着列表长度）。
+
+### 怎么自己验证这块
+
+```bash
+python3 scripts/verify_gena.py            # 37 条：SCPD 声明 / 源码接线 / 订阅行为
+python3 scripts/selftest_gena_red.py      # 6 项注入，证明上面那些断言真会红
+python3 scripts/verify_setnext.py         # 13 条：预载不得打断当前播放
+python3 scripts/selftest_setnext_red.py   # 反向：换回旧实现必须变红
+```
+
+一个提醒：**播完停住不一定是本应用的问题**。如果手机 App 压根没订阅事件、
+也没发 `SetNextAVTransportURI`，那它就没打算连播——这种情况用网页端
+推送列表最省事，一次把整季地址贴进去。
+
+---
+
 ## 已知限制
 
 1. **编码兼容性**：AVPlayer 不支持 MKV 里的某些音频编码（如 DTS、部分 AC3 变体），会出现有画面无声音。这是 tvOS 原生限制，UnPlay 靠集成 FFmpeg 解决，本项目未做。
@@ -628,6 +723,9 @@ urls=<URL编码的"标题$地址"列表>&option=native&mode=playList
 3. **HDR 需要 tvOS 侧配合**：设置 → 视频和音频 → 匹配内容 → 打开「匹配动态范围」。
 4. **组播受干扰**：YouTube 等 App 可能占用网络端口，投屏搜不到时先关闭其他 App 后台。
 5. **只做 DLNA，不做 AirPlay 接收端**（结构性限制，无法绕过）。详见下一节。
+6. **DLNA 单集投屏的连播取决于手机 App**：协议上 `SetAVTransportURI` 只带一条
+   地址。手机端不发 `SetNextAVTransportURI`、也不订阅事件的话，电视无从知道
+   后面还有没有下一集 —— 这不是本应用的缺陷，UnPlay 同样如此。详见上一节。
 
 ---
 

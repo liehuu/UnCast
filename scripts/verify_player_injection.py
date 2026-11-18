@@ -76,12 +76,28 @@ def main() -> int:
         print("找不到 PlayerView.swift")
         return 2
 
+    # 残留自检：上一次运行被中断（Ctrl-C / SIGTERM / 工具超时）时，
+    # with_patch 的 finally 来不及执行，源码会留着注入版本。
+    #
+    # 这不是理论风险 —— 实际发生过：一次 run 被 SIGTERM 掐掉，
+    # PlayerView.swift 里留下了 `guard true else`，之后所有验证都红，
+    # 看起来像「代码坏了」，其实是测试工具自己污染了被测文件。
+    # 必须在这里拦下来，并说清楚怎么修。
+    leftover = PLAYER + ".orig"
+    if os.path.isfile(leftover):
+        shutil.move(leftover, PLAYER)
+        print(f"[清理] 发现上次中断遗留的备份，已用它还原 {os.path.basename(PLAYER)}")
+        print("       如果这次仍然基线不绿，用 `git checkout -- "
+              f"{PLAYER}` 从版本库恢复")
+
     shutil.copy2(PLAYER, PLAYER + ".orig")
 
     rc, fails = run_verify()
     print(f"[基线] rc={rc}, fails={len(fails)}")
     if rc != 0:
         print("基线不绿，无法做变异测试")
+        print("提示：先确认源码干净 —— git status 看有没有注入残留，"
+              "必要时 git checkout -- " + PLAYER)
         shutil.move(PLAYER + ".orig", PLAYER)
         return 1
 

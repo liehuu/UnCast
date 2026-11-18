@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// DLNA 接收器总协调器。
@@ -49,6 +50,18 @@ final class DLNAService: ObservableObject {
     private var ssdp: SSDPResponder?
     private var http: HTTPServer?
 
+    /// GENA 事件订阅表。手机端订了才会收到「播完了」的通知，
+    /// 收到通知才会推下一集 —— 连播链路的关键一环，见 EventSubscription 注释。
+    private let events = EventSubscription()
+
+    /// 上次已推送过的传输状态。只在**变化时**发事件，
+    /// 否则每 0.5 秒的进度回调会把 NOTIFY 刷成洪水。
+    private var lastNotifiedState: PlaybackState?
+    private var lastNotifiedURI: String?
+
+    /// 事件订阅的 Combine 凭据。不持有它，sink 立刻被释放，一条事件都发不出去。
+    private var cancellables = Set<AnyCancellable>()
+
     /// 保护 start/stop 的并发调用（UI 与后台线程都可能触发）
     private let lifecycleLock = NSLock()
     private var _running = false
@@ -69,6 +82,34 @@ final class DLNAService: ObservableObject {
 
         let savedName = UserDefaults.standard.string(forKey: "uncast.device.name")
         friendlyName = (savedName?.isEmpty == false) ? savedName! : "UnCast (Apple TV)"
+
+        // 播完立刻推事件。这是手机端能自动连播的唯一依据：
+        // 它收到 STOPPED（或新一集的 PLAYING）才知道该推下一集。
+        engine.onPlaybackFinished = { [weak self] in
+            guard let self else { return }
+            // 等一帧再发：handlePlaybackEnd 里 repeatAll 已经 loadAndPlay 新集，
+            // 此时 state/currentItem 才是新值。立刻发会push 出旧的 URI。
+            DispatchQueue.main.async {
+                self.notifyStateNow()
+            }
+        }
+
+        // state / currentItem 变化时推事件（内部按「值是否真的变了」去重，
+        // 不会被 0.5 秒的进度回调刷成洪水）。
+        //
+        // 两个 publisher 分开订阅而不是 merge：$state 是 PlaybackState、
+        // $currentItem 是 MediaItem?，类型不同，merge 需要先 map 成同一类型，
+        // 而 map 出来的中间类型在 tvOS 15 的旧 Combine 上容易推不出来。
+        // 分开订阅多两行，但没有类型风险。
+        engine.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.notifyIfStateChanged() }
+            .store(in: &cancellables)
+
+        engine.$currentItem
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.notifyIfStateChanged() }
+            .store(in: &cancellables)
     }
 
     // MARK: - 主线程派发helper
@@ -236,11 +277,11 @@ final class DLNAService: ObservableObject {
             let serviceName = p.replacingOccurrences(of: "/upnp/control/", with: "")
             return handleSOAP(request, serviceHint: serviceName)
 
-        case ("SUBSCRIBE", _), ("UNSUBSCRIBE", _):
-            var resp = HTTPServer.Response()
-            resp.headers["SID"] = "uuid:\(uuid)-event"
-            resp.headers["TIMEOUT"] = "Second-1800"
-            return resp
+        case ("SUBSCRIBE", _):
+            return handleSubscribe(request)
+
+        case ("UNSUBSCRIBE", _):
+            return handleUnsubscribe(request)
 
         case ("GET", "/PlaybackEvent"):
             return handlePlaybackEvent()
@@ -258,6 +299,120 @@ final class DLNAService: ObservableObject {
 
         default:
             return .text("Not Found", status: 404)
+        }
+    }
+
+    // MARK: - GENA 事件订阅
+
+    /// SUBSCRIBE 处理。
+    ///
+    /// 三种情况要分开：
+    /// - 带 `SID` → 续订（客户端定期续，否则 1800 秒后失效）
+    /// - 带 `CALLBACK` → 新订阅
+    /// - 都不带 → 400，不是 200。旧实现无脑回 200 + 编造的 SID，
+    ///   客户端会以为自己订上了，然后永远等不到通知。
+    private func handleSubscribe(_ request: HTTPServer.Request) -> HTTPServer.Response {
+        let timeout = EventSubscription.parseTimeout(request.headers["timeout"])
+        var resp = HTTPServer.Response()
+        resp.headers["TIMEOUT"] = "Second-\(timeout)"
+
+        // 续订
+        if let sid = request.headers["sid"], !sid.isEmpty {
+            if events.renew(sid: sid, timeout: timeout) {
+                resp.headers["SID"] = sid
+                appendLogOnMain("🔔 续订事件 \(sid.prefix(13))")
+                return resp
+            }
+            // 规范要求：未知 SID 回 412，让客户端重新订阅
+            var bad = HTTPServer.Response()
+            bad.status = 412
+            bad.headers["Content-Type"] = "text/plain; charset=utf-8"
+            return bad
+        }
+
+        // 新订阅
+        guard let callback = EventSubscription.parseCallback(request.headers["callback"]) else {
+            var bad = HTTPServer.Response()
+            bad.status = 400
+            bad.headers["Content-Type"] = "text/plain; charset=utf-8"
+            return bad
+        }
+
+        let sid = events.subscribe(callback: callback, timeout: timeout)
+        resp.headers["SID"] = sid
+        appendLogOnMain("🔔 手机端订阅事件 \(sid.prefix(13)) → \(callback.host ?? "?")")
+
+        // 规范要求：新订阅后必须先推一次**当前全部状态**（初始事件），
+        // 否则客户端拿不到基线，后续的增量事件它无从比较。
+        let snapshot = onMainSync { [weak self] () -> (String, Int)? in
+            guard let self else { return nil }
+            return (self.engine.state.rawValue, self.engine.volumePercent)
+        }
+        if let (state, vol) = snapshot {
+            sendStateEvent(state: state, trackURI: engine.currentItem?.url.absoluteString ?? "",
+                           duration: engine.duration, volume: vol)
+        }
+        return resp
+    }
+
+    private func handleUnsubscribe(_ request: HTTPServer.Request) -> HTTPServer.Response {
+        var resp = HTTPServer.Response()
+        if let sid = request.headers["sid"], events.unsubscribe(sid: sid) {
+            appendLogOnMain("🔕 取消订阅 \(sid.prefix(13))")
+            return resp
+        }
+        // 没有 SID 或订不存在：规范要求 412
+        resp.status = 412
+        return resp
+    }
+
+    /// 状态变化时推事件。**只在变化时**推 —— 被 0.5 秒的进度回调驱动，
+    /// 不判断变化就会每秒刷两条 NOTIFY 把手机端淹掉。
+    func notifyIfStateChanged() {
+        let (state, uri) = onMainSync { [weak self] () -> (PlaybackState, String) in
+            guard let self else { return (.stopped, "") }
+            return (self.engine.state, self.engine.currentItem?.url.absoluteString ?? "")
+        }
+        guard state != lastNotifiedState || uri != lastNotifiedURI else { return }
+        lastNotifiedState = state
+        lastNotifiedURI = uri
+
+        let (dur, vol) = onMainSync { [weak self] () -> (Double, Int) in
+            guard let self else { return (0, 100) }
+            return (self.engine.duration, self.engine.volumePercent)
+        }
+        sendStateEvent(state: state.rawValue, trackURI: uri, duration: dur, volume: vol)
+    }
+
+    /// 主动推一次当前状态（不判断是否变化）。
+    /// 播完/切集这类**必须**让手机知道的事件走这里。
+    func notifyStateNow() {
+        let info = onMainSync { [weak self] () -> (String, String, Double, Int)? in
+            guard let self else { return nil }
+            return (self.engine.state.rawValue,
+                    self.engine.currentItem?.url.absoluteString ?? "",
+                    self.engine.duration,
+                    self.engine.volumePercent)
+        }
+        guard let (state, uri, dur, vol) = info else { return }
+        lastNotifiedState = PlaybackState(rawValue: state)
+        lastNotifiedURI = uri
+        sendStateEvent(state: state, trackURI: uri, duration: dur, volume: vol)
+    }
+
+    private func sendStateEvent(state: String, trackURI: String, duration: Double, volume: Int) {
+        let body = EventSubscription.lastChangeBody(
+            transportState: state,
+            currentTrackURI: trackURI,
+            currentTrackDuration: Self.formatDuration(duration),
+            currentPlayMode: engine.playMode.rawValue
+        )
+        let log: (String) -> Void = { [weak self] msg in self?.appendLogOnMain(msg) }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.events.notify(body: body, log: log)
+            // RenderingControl 的 Volume 跟着发一份，部分客户端订的是这个服务
+            self.events.notify(body: EventSubscription.volumeBody(volume: volume), log: log)
         }
     }
 
@@ -308,11 +463,14 @@ final class DLNAService: ObservableObject {
         case "SetNextAVTransportURI":
             if let uriString = args["NextURI"], let url = URL(string: uriString), url.scheme != nil {
                 let title = args["NextURIMetaData"].flatMap { SOAP.titleFromDIDL($0) }
-                let item = MediaItem(title: title ?? PlaybackEngine.guessTitle(from: url), url: url)
-                var list = engine.playlist
-                if !list.contains(item) { list.append(item) }
-                engine.castPlaylist(list, mode: engine.playMode, startAt: engine.currentIndex)
-                appendLogOnMain("➕ 追加到列表: \(item.title)")
+                // 只入队，绝不重新加载当前项。
+                // 旧实现调的是 castPlaylist(_:mode:startAt:)，它内部无条件
+                // loadAndPlay(currentIndex)，会把正在播的这一集重置回 0:00。
+                // 手机端在播放中预载下一集时，用户会看到画面突然跳回开头。
+                engine.appendToQueue(url: url, title: title)
+                // 入队后若队列里的下一集还没顶上来，保持原播放模式：
+                // 单集模式（NORMAL）下播完仍应停止，不能因为预载了下集就变成循环。
+                appendLogOnMain("➕ 已排入下一集: \(title ?? url.lastPathComponent)")
             }
             return []
 
