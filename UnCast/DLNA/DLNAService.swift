@@ -338,21 +338,48 @@ final class DLNAService: ObservableObject {
             return bad
         }
 
-        let sid = events.subscribe(callback: callback, timeout: timeout)
+        // 订的是哪个服务，从 eventSubURL 路径里取：
+        // /upnp/event/AVTransport → AVTransport
+        // /upnp/event/RenderingControl → RenderingControl
+        // 取不到就按 AVTransport 处理（绝大多数客户端只订这个）。
+        let service = Self.serviceName(fromEventURL: request.path)
+        let sid = events.subscribe(callback: callback, timeout: timeout, service: service)
         resp.headers["SID"] = sid
-        appendLogOnMain("🔔 手机端订阅事件 \(sid.prefix(13)) → \(callback.host ?? "?")")
+        appendLogOnMain("🔔 订阅事件 \(sid.prefix(13)) [\(service)] → \(callback.host ?? "?")")
 
         // 规范要求：新订阅后必须先推一次**当前全部状态**（初始事件），
         // 否则客户端拿不到基线，后续的增量事件它无从比较。
-        let snapshot = onMainSync { [weak self] () -> (String, Int)? in
+        //
+        // 注意这里必须整体走 onMainSync 一次取全：分几次读会让
+        // state / uri / duration 来自不同时刻，客户端算出不一致的基线。
+        let snapshot = onMainSync { [weak self] () -> (String, String, Double, Int)? in
             guard let self else { return nil }
-            return (self.engine.state.rawValue, self.engine.volumePercent)
+            return (self.engine.state.rawValue,
+                    self.engine.currentItem?.url.absoluteString ?? "",
+                    self.engine.duration,
+                    self.engine.volumePercent)
         }
-        if let (state, vol) = snapshot {
-            sendStateEvent(state: state, trackURI: engine.currentItem?.url.absoluteString ?? "",
-                           duration: engine.duration, volume: vol)
+        if let (state, uri, dur, vol) = snapshot {
+            sendStateEvent(state: state, trackURI: uri, duration: dur, volume: vol)
         }
         return resp
+    }
+
+    /// 从 eventSubURL 路径解析服务名。
+    /// `/upnp/event/AVTransport` → `AVTransport`；取不到时按 AVTransport 兜底。
+    static func serviceName(fromEventURL path: String) -> String {
+        var name = path.replacingOccurrences(of: "/upnp/event/", with: "")
+        // 去掉结尾的实例号（少数客户端把 eventSubURL 写成 AVTransport1）。
+        // 只剥数字，不剥别的 —— "ConnectionManager" 结尾是 r，不受影响。
+        while let last = name.last, last.isNumber {
+            name.removeLast()
+        }
+        switch name {
+        case "AVTransport", "RenderingControl", "ConnectionManager":
+            return name
+        default:
+            return "AVTransport"
+        }
     }
 
     private func handleUnsubscribe(_ request: HTTPServer.Request) -> HTTPServer.Response {
@@ -401,18 +428,29 @@ final class DLNAService: ObservableObject {
     }
 
     private func sendStateEvent(state: String, trackURI: String, duration: Double, volume: Int) {
+        // playMode 必须在主线程读 —— PlaybackEngine 的线程契约是
+        // 所有属性只在主线程访问（本类不标 @MainActor，编译器不会拦）。
+        // 在后台闭包里直接读 engine.playMode 是隐性违规。
+        let playMode = onMainSync { [weak self] () -> String in
+            self?.engine.playMode.rawValue ?? "NORMAL"
+        }
         let body = EventSubscription.lastChangeBody(
             transportState: state,
             currentTrackURI: trackURI,
             currentTrackDuration: Self.formatDuration(duration),
-            currentPlayMode: engine.playMode.rawValue
+            currentPlayMode: playMode
         )
+        let volumeBody = EventSubscription.volumeBody(volume: volume)
         let log: (String) -> Void = { [weak self] msg in self?.appendLogOnMain(msg) }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            self.events.notify(body: body, log: log)
-            // RenderingControl 的 Volume 跟着发一份，部分客户端订的是这个服务
-            self.events.notify(body: EventSubscription.volumeBody(volume: volume), log: log)
+        // events 是 let 常量、内部全部走 NSLock，跨线程访问安全；
+        // 把它先绑到局部变量，避免后台闭包捕获 self。
+        let events = self.events
+        DispatchQueue.global(qos: .utility).async {
+            events.notify(body: body, service: "AVTransport", log: log)
+            // RenderingControl 的 Volume 发给订了那个服务的客户端。
+            // 不能发给 AVTransport 的订阅者：它解析 LastChange 时找不到
+            // 自己关注的 TransportState，严格实现会判为格式错误。
+            events.notify(body: volumeBody, service: "RenderingControl", log: log)
         }
     }
 

@@ -10,3 +10,4 @@ build.log
 
 # 本地生成的预览/产物
 dist/
+ci_log*.txt

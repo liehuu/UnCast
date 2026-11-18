@@ -32,8 +32,18 @@ final class EventSubscription {
         let sid: String
         /// 回调地址，客户端在 CALLBACK 头里给
         let callbackURL: URL
-        /// 订阅到期时间（客户端 TIMEOUT 头指定，规范要求不超过 1800 秒）
-        let expiresAt: Date
+        /// 订阅的是哪个服务（AVTransport / RenderingControl）。
+        ///
+        /// 为什么要区分：两个服务各有自己的 eventSubURL，客户端是分开订阅的。
+        /// 把 Volume 事件发给 AVTransport 的订阅者，严格客户端解析 LastChange
+        /// 时找不到它要的 TransportState，会当成格式错误。
+        let service: String
+        /// 订阅到期时间（客户端 TIMEOUT 头指定，规范要求不超过 1800 秒）。
+        ///
+        /// 必须是 `var`：续订（带 SID 再发 SUBSCRIBE）要在这个结构体的副本上
+        /// 推后到期时间。写成 `let` 编译器直接报
+        /// `cannot assign to property: 'expiresAt' is a 'let' constant`。
+        var expiresAt: Date
         /// 同一订阅的事件序号，从 0 开始自增
         var seq: Int = 0
     }
@@ -88,12 +98,13 @@ final class EventSubscription {
     }
 
     /// 新建订阅，返回 SID。
-    func subscribe(callback: URL, timeout: Int) -> String {
+    func subscribe(callback: URL, timeout: Int, service: String) -> String {
         let sid = Self.makeSID()
         lock.lock()
         subscribers[sid] = Subscriber(
             sid: sid,
             callbackURL: callback,
+            service: service,
             expiresAt: Date().addingTimeInterval(TimeInterval(timeout))
         )
         lock.unlock()
@@ -132,12 +143,14 @@ final class EventSubscription {
 
     /// 取出当前全部有效订阅并各自分配 SEQ。
     /// 分配在锁内完成，避免两个并发 NOTIFY 拿到同一个序号。
-    private func takeTargets() -> [Subscriber] {
+    /// - Parameter service: 只取订了这个服务的订阅者；nil 表示全部。
+    private func takeTargets(service: String?) -> [Subscriber] {
         lock.lock()
         defer { lock.unlock() }
         pruneExpired()
         var out: [Subscriber] = []
         for (sid, var sub) in subscribers {
+            if let service, sub.service != service { continue }
             sub.seq += 1
             subscribers[sid] = sub
             out.append(sub)
@@ -210,14 +223,16 @@ final class EventSubscription {
 
     // MARK: - 发送
 
-    /// 向所有订阅者推一条 NOTIFY。
+    /// 向订了指定服务的订阅者推一条 NOTIFY。
     ///
-    /// 用同步 URLSession 在后台队列发，不占主线程。
+    /// 用 URLSession 在后台发，不占主线程。
     /// 发送失败**不重试**：UPnP 的 GENA 本身就允许丢包，
     /// 客户端靠下一次事件或轮询 GetTransportInfo 恢复。
     /// 重试反而会在客户端已经退订后继续骚扰它。
-    func notify(body: String, log: @escaping (String) -> Void = { _ in }) {
-        let targets = takeTargets()
+    /// - Parameter service: 目标服务；nil 表示不筛（调试用）。
+    func notify(body: String, service: String? = nil,
+                log: @escaping (String) -> Void = { _ in }) {
+        let targets = takeTargets(service: service)
         guard !targets.isEmpty else { return }
 
         for sub in targets {
