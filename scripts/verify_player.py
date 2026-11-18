@@ -8,7 +8,21 @@
 但 v1 按左右永远在快进（焦点永远进不了按钮），v2 焦点一旦进过按钮就
 永远出不来（左右再也 seek 不了、控制层也再也不会自动隐藏）。
 
-所以判据必须落在**源码结构**上，把"互斥状态机"这个设计意图写成可失败的断言。
+v3 更隐蔽：它把方向键处理挂在 SwiftUI 的 `onMoveCommand` 上，而
+`onMoveCommand` **依赖焦点**。控制层隐藏时 `focus = nil`，视图树里没有
+任何可聚焦元素，tvOS 焦点引擎无处派发 —— 于是
+`case .up, .down: revealControls()` 那段代码**一次都不会执行**。
+分支写着"上下键呼出控制层"，静态看起来完全正确，只有真机上按键
+毫无反应才暴露。这是"控制层调不回来"和"方向键控不了进度"的
+同一个根因：按键根本没进来。
+
+## v4 的契约
+
+1. **常驻焦点锚点**：承载视频的全屏 UIView 自己 `canBecomeFocused`，
+   在非按钮态持有焦点，方向键经 `pressesBegan` 进入。
+2. **三级累进**：hidden → progress → buttons，每级按键含义不重叠。
+3. **互斥**：按钮态必须关掉 `canBecomeFocused` 与 `capturesKeys`，
+   否则全屏锚点会一直霸占焦点，按钮永远聚焦不上。
 
 ## 断言的三段式要求
 
@@ -160,6 +174,71 @@ def find_branch(src: str, condition: str) -> str:
     return extract_block(src, m.end() - 1)
 
 
+def _case_marks(inner: str) -> list[tuple[int, int, str]]:
+    """扫出一层 switch 里所有 case 的 (起始偏移, 冒号偏移, 标签)。
+
+    只看花括号深度 0 —— 嵌套 switch 里的 case 属于别的 switch，
+    混进来会把外层分支切碎（本脚本第一版就这么错过了 B1/B2）。
+    """
+    marks: list[tuple[int, int, str]] = []
+    depth = 0
+    i, n = 0, len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and inner.startswith("case ", i):
+            j = i - 1
+            while j >= 0 and inner[j] in " \t":
+                j -= 1
+            if j < 0 or inner[j] == "\n":          # 必须是行首（前面只有空白）
+                colon = inner.find(":", i)
+                brk = inner.find("\n", i)
+                if colon > 0 and (brk < 0 or colon < brk):
+                    marks.append((i, colon, inner[i + 5:colon].strip()))
+                    i = colon + 1
+                    continue
+        i += 1
+    return marks
+
+
+def switch_arms(text: str) -> list[tuple[str, str]]:
+    """把文本里**第一个** switch 拆成 [(标签, 分支体), ...]。
+
+    为什么要这个函数：`"level = .buttons" in down_body` 这种子串判断
+    会被同层 `case .buttons:` 这个**标签本身**命中 —— 把 `.progress`
+    臂掏空成 `break` 之后标签还在，断言永远是绿的。本项目第一版变异
+    测试的 B1/B2 就是这么假 PASS 的。判据必须精确到「那一格」。
+    """
+    idx = text.find("switch")
+    if idx < 0:
+        return []
+    block = extract_block(text, idx)          # 含首尾花括号
+    if not block:
+        return []
+    inner = block[1:-1]
+    marks = _case_marks(inner)
+    arms: list[tuple[str, str]] = []
+    for k, (_start, colon, label) in enumerate(marks):
+        end = marks[k + 1][0] if k + 1 < len(marks) else len(inner)
+        arms.append((label, inner[colon + 1:end]))
+    return arms
+
+
+def case_arm(text: str, label: str) -> str:
+    """取第一个 switch 里某个 case 的整臂（含它自己的嵌套 switch）。"""
+    for lab, body in switch_arms(text):
+        if lab == label:
+            return body
+    return ""
+
+
 def main() -> int:
     try:
         raw = open(PLAYER, encoding="utf-8").read()
@@ -170,109 +249,164 @@ def main() -> int:
     src = strip_comments(raw)
     c = Checker()
 
-    # ─────────────────────────── 1. 状态机骨架
-    print("== 1. 焦点状态必须是「单一真源」 ==")
+    # ─────────────────────────── 1. 焦点锚点（v4 核心）
+    print("== 1. 必须存在常驻焦点锚点（否则方向键永远收不到）==")
 
-    # 必须有 @FocusState 枚举绑定（v2 的 onFocusChange 回调方案已废弃）
-    c.check("@FocusState private var focus: Control?" in src,
-            "用 @FocusState 枚举承载焦点状态")
+    # 这是 v3「控制层调不回来」的根因：没有可聚焦元素，焦点引擎
+    # 不派发方向键，onMoveCommand 永不触发。
+    #
+    # 允许两种实现：
+    #   A. UIKit 的 canBecomeFocused（本版）
+    #   B. SwiftUI 的 .focusable()（需同时关掉焦点外观）
+    has_uikit_anchor = "override var canBecomeFocused" in src
+    has_swiftui_anchor = re.search(r"\.focusable\(", src) is not None
+    c.check(has_uikit_anchor or has_swiftui_anchor,
+            "存在焦点锚点（canBecomeFocused 或 .focusable）")
 
-    # 焦点是否在控制层必须是纯派生，而不是存的 @State
-    has_derived = bool(re.search(
-        r"private var isFocusInControls: Bool\s*\{\s*focus\s*!=\s*nil\s*\}", src))
-    c.check(has_derived, "isFocusInControls 是派生计算属性（focus != nil）")
+    # 锚点必须是**动态**的：按钮态要能让位
+    c.check(re.search(
+        r"override\s+var\s+canBecomeFocused\s*:\s*Bool\s*\{\s*capturesKeys\s*\}",
+        src) is not None,
+        "canBecomeFocused 是动态的（按钮态让位给按钮）")
 
-    # 反向：不能再有独立存储的 focusInControls 状态
-    stored = re.search(r"@State\s+private\s+var\s+focusInControls", src)
-    c.check(stored is None,
-            "不存在独立的 @State focusInControls（防状态残留）")
+    # 方向键必须从 pressesBegan 进，不能只靠 onMoveCommand
+    c.check("override func pressesBegan" in src,
+            "在 pressesBegan 里接管方向键（不依赖焦点派发的 onMoveCommand）")
 
-    # 反向：不能再有上报回调式的焦点同步
-    callback = re.search(r"onFocusChange", src)
-    c.check(callback is None, "不存在 onFocusChange 上报回调（v2 缺陷来源）")
+    pb = body_of(src, "override func pressesBegan")
+    c.check(bool(pb), "pressesBegan 有实现")
+    if pb:
+        for key in (".upArrow", ".downArrow", ".leftArrow", ".rightArrow"):
+            c.check(key in pb, f"pressesBegan 处理 {key}")
 
-    # ─────────────────────────── 2. 方向键仲裁
-    print("\n== 2. 方向键仲裁必须互斥 ==")
+    # 关键互斥：按钮态必须放行按键，否则按钮永远聚焦不上
+    c.check(re.search(r"guard\s+capturesKeys\s+else\s*\{", pb) is not None,
+            "pressesBegan 在非捕获态放行按键（按钮态让位焦点引擎）",
+            pb.strip()[:80] if pb else "")
+
+    # 焦点外观必须关掉，否则整屏视频会有一圈白光晕
+    c.check(re.search(r"override\s+var\s+focusEffect\s*:\s*UIFocusEffect\?\s*\{\s*nil\s*\}",
+                      src) is not None,
+            "focusEffect 为 nil（全屏视频不画焦点光晕）")
+
+    # ─────────────────────────── 2. 三级累进状态机
+    print("\n== 2. 控制层必须是三级累进 ==")
+
+    c.check(re.search(r"enum\s+Level\s*:\s*Int", src) is not None,
+            "存在 Level 枚举（三级累进）")
+    for case in ("case hidden", "case progress", "case buttons"):
+        c.check(case in src, f"Level 含 {case}")
+
+    # 两个控制层必须分别存在，不能合并成一个
+    c.check(bool(body_of(src, "private var progressLayer")),
+            "存在独立的进度条层 progressLayer")
+    c.check(bool(body_of(src, "private var buttonsLayer")),
+            "存在独立的按钮层 buttonsLayer")
+
+    # 进度条层里**不能**有按钮；这是"按一下只看进度"的前提
+    pl = body_of(src, "private var progressLayer")
+    if pl:
+        c.check("controlButtons" not in pl,
+                "进度条层不含按钮行（用户按一下就只看进度）")
+
+    # ─────────────────────────── 3. 方向键仲裁
+    print("\n== 3. 方向键语义必须互斥 ==")
     handle = body_of(src, "private func handleMove")
     c.check(bool(handle), "handleMove 存在")
     if handle:
-        # 2a. 焦点在按钮上时，左右必须**不**seek
-        #     结构判据：isFocusInControls 分支在 seek 调用之前 return
-        m = re.search(
-            r"if\s+isFocusInControls\s*\{([\s\S]*?)\n        \}", handle)
-        c.check(m is not None, "存在 isFocusInControls 早退分支")
-        if m:
-            branch = m.group(1)
-            c.check("seek(" not in branch,
-                    "焦点在控制层时分支内不调用 seek（左右键让给焦点引擎）",
-                    branch.strip()[:80])
-            c.check("return" in branch, "该分支以 return 早退")
-
-        # 2b. seek 只能出现在看片态
-        seek_calls = [x for x in re.findall(r"\bseek\((-?\d+)\)", handle)]
+        # 左右始终 seek，步长 15
+        seek_calls = re.findall(r"\bseek\((-?\d+)\)", handle)
         c.check(seek_calls == ["-15", "15"],
-                "看片态左右分别为 -15 / +15 秒", str(seek_calls))
+                "左右分别为 -15 / +15 秒", str(seek_calls))
 
-        # 2c. 上下键必须能唤回控制层（"一旦隐藏就调不出来"的解药）
-        c.check("revealControls" in handle,
-                "handleMove 内能呼出控制层")
-        c.check(re.search(r"case \.up, \.down", handle) is not None,
-                "上下键合并为同一分支（都呼出控制层）")
+        # 下：hidden → progress → buttons（逐级展开）
+        down_body = case_arm(handle, ".down")
+        c.check(bool(down_body), "handleMove 有 .down 分支")
+        if down_body:
+            # 逐级展开必须落在**各自那一格**里。
+            # 不能只看 down_body 里有没有 ".progress" / ".buttons"：
+            # `case .progress:` 这个标签本身含 ".progress"，
+            # 把该格掏空成 break 后子串照样命中 —— 假 PASS。
+            d_arms = dict(switch_arms(down_body))
+            c.check(".hidden" in d_arms and ".progress" in d_arms,
+                    "下键用三级 switch 仲裁（不是布尔量取反）",
+                    str(list(d_arms)))
+            c.check("level = .progress" in d_arms.get(".hidden", ""),
+                    "下键在隐藏态呼出进度条",
+                    d_arms.get(".hidden", "").strip()[:60])
+            c.check("level = .buttons" in d_arms.get(".progress", ""),
+                    "下键逐级展开到按钮层",
+                    d_arms.get(".progress", "").strip()[:60])
 
-    # ─────────────────────────── 3. 控制层可恢复性
-    print("\n== 3. 控制层隐藏后必须可恢复 ==")
+        # 上：hidden 时也要能呼出进度条（用户明确要求）
+        up_body = case_arm(handle, ".up")
+        c.check(bool(up_body), "handleMove 有 .up 分支")
+        if up_body:
+            u_arms = dict(switch_arms(up_body))
+            c.check("level = .progress" in u_arms.get(".hidden", ""),
+                    "上键在隐藏态也能呼出进度条",
+                    u_arms.get(".hidden", "").strip()[:60])
+            c.check("level = .hidden" in u_arms.get(".progress, .buttons", ""),
+                    "上键在控制层里时收起",
+                    u_arms.get(".progress, .buttons", "").strip()[:60])
 
-    reveal = body_of(src, "private func revealControls")
-    c.check(bool(reveal), "revealControls 存在")
-    if reveal:
-        c.check("showControls = true" in reveal,
-                "revealControls 置 showControls = true")
+    # ─────────────────────────── 4. 控制层可恢复性
+    print("\n== 4. 控制层隐藏后必须可恢复 ==")
 
-    collapse = body_of(src, "private func collapseControls")
-    c.check(bool(collapse), "collapseControls 存在")
-    if collapse:
-        c.check("focus = nil" in collapse,
-                "collapseControls 先释放焦点再收层")
-        c.check("showControls = false" in collapse,
-                "collapseControls 置 showControls = false")
+    # 隐藏态必须是 level = .hidden 而不是 showControls = false —— 后者
+    # 是布尔量，表达不了三级
+    c.check(re.search(r"@State\s+private\s+var\s+level\s*:\s*Level\s*=", src) is not None,
+            "level 用 @State 承载")
 
-    # 自动隐藏的三条守卫必须都在，且不能依赖"会残留"的状态。
-    #
-    # 这里只认**行为**，不认写法：`focus == nil` 与 `!isFocusInControls`
-    # 语义完全等价，用字面量去卡其中一种就是过度拟合实现文本，
-    # 会在合法重构时报假 FAIL（本脚本早先就犯过）。
-    hide = body_of(src, "private func scheduleHide")
-    c.check(bool(hide), "scheduleHide 存在")
-    if hide:
-        has_focus_guard = (re.search(r"focus\s*==\s*nil", hide) is not None
-                           or re.search(r"!\s*isFocusInControls", hide) is not None)
-        c.check(has_focus_guard,
-                "自动隐藏前检查焦点（否则用户正在选按钮时面板会消失）",
-                hide.strip()[:100])
-        c.check(re.search(r"engine\.state\s*==\s*\.playing", hide) is not None,
+    restart = body_of(src, "private func restartHide")
+    c.check(bool(restart), "restartHide 存在")
+    if restart:
+        c.check(re.search(r"engine\.state\s*==\s*\.playing", restart) is not None,
                 "自动隐藏前检查是否正在播放（暂停时不隐藏）")
-        c.check("showInspector" in hide,
+        c.check("showInspector" in restart,
                 "自动隐藏前检查检查器是否打开")
-        # 反向：绝不能因为某个"存起来的状态"永久挡住隐藏
-        c.check("focusInControls" not in hide,
-                "守卫不引用已废弃的存储态 focusInControls")
+        c.check("focus" in restart,
+                "自动隐藏前检查按钮焦点（用户正在选按钮时不隐藏）")
 
-    # 必须有 UIKit 点按通道：tvOS 15 无 onTapGesture 点击语义
+    # 焦点意外丢失时必须有兜底：退回进度条态，让锚点重新接住按键
+    c.check(re.search(
+        r"\.onChange\(of:\s*focus\)[\s\S]{0,300}?level\s*=\s*\.progress", src)
+        is not None,
+        "焦点意外丢失时退回进度条态（防止再次陷入无焦点死区）")
+
+    # 从按钮态回到锚点态时必须主动要焦点。
+    #
+    # 判据必须钉在 updateUIView 里那一处：PlayerContainerView
+    # 的 didMoveToWindow 里也有一次 setNeedsFocusUpdate（首次上屏用），
+    # 只看"全文有没有这个词"的话，删掉 updateUIView 那处仍能命中
+    # 另一处 —— 这就是变异测试 B10 报假 PASS 的原因。
+    upd = body_of(src, "func updateUIView")
+    c.check(bool(upd), "updateUIView 存在")
+    if upd:
+        c.check("setNeedsFocusUpdate" in upd,
+                "切回锚点态时主动请求焦点更新",
+                upd.strip()[:80])
+        c.check(re.search(r"capturesKeys\s*&&\s*!\s*wasCapturing", upd) is not None,
+                "只在「按钮态 → 锚点态」这一跃迁上要焦点（不是每帧都要）")
+
+    # ─────────────────────────── 5. 点按手势不能抢按键
+    print("\n== 5. 点按手势只允许在看片态启用 ==")
     c.check("UITapGestureRecognizer" in src,
             "用 UITapGestureRecognizer 提供点按（兼容 tvOS 15）")
-    c.check("allowedPressTypes" in src,
-            "手势限定 select 按键")
-
-    # 关键：手势必须在控制层显示时禁用，否则确定键被抢
+    c.check("allowedPressTypes" in src, "手势限定 select 按键")
     c.check(re.search(r"tap\.isEnabled\s*=\s*tapEnabled", src) is not None,
             "手势启用状态跟随 tapEnabled")
     c.check(re.search(r"tapGesture\?\.isEnabled\s*=\s*tapEnabled", src) is not None,
             "updateUIView 同步手势启用状态")
-    c.check("tapEnabled: !showControls" in src,
-            "调用处按 showControls 反向绑定（显示时禁用）")
+    c.check("tapEnabled: level == .hidden" in src,
+            "点按仅在看片态启用（其余两态已在播控界面里）")
 
-    # ─────────────────────────── 4. 焦点与按钮绑定
-    print("\n== 4. 按钮焦点必须绑定同一 FocusState ==")
+    # capturesKeys 与 tapEnabled 必须分开：进度条态要收按键但不要点按
+    c.check(re.search(r"capturesKeys:\s*level\s*!=\s*\.buttons", src) is not None,
+            "按键捕获与点按是两件事（进度条态收按键但不点按）")
+
+    # ─────────────────────────── 6. 焦点与按钮绑定
+    print("\n== 6. 按钮焦点必须绑定同一 FocusState ==")
 
     btn = body_of(src, "struct CircleButton")
     c.check(bool(btn), "CircleButton 存在")
@@ -280,30 +414,41 @@ def main() -> int:
         c.check("FocusState<PlayerView.Control?>.Binding" in btn,
                 "按钮接收父视图的 FocusState 绑定")
         c.check(re.search(r"\.focused\(focus,\s*equals:\s*tag\)", btn) is not None,
-                "用 .focused(_:equals:) 绑定（而非独立 @FocusState）")
-        # 反向：不能再有按钮自己的 @FocusState（会导致双源）
-        c.check("@FocusState" not in btn,
-                "按钮内部不再持有独立 @FocusState")
+                "用 .focused(_:equals:) 绑定")
+        # 按钮内部不能有任何可变状态。
+        #
+        # 早先只查 `"@FocusState" not in btn`，抓不住把焦点另存成
+        # `@State var ownFocusFlag` 的写法（v2 的真实缺陷：焦点双真源，
+        # 进过按钮就再也出不来）。子串 `@FocusState` 不含 `@State`，
+        # 断言看着在守，实际一条都拦不住。这里逐个列出所有可变
+        # 属性包裹器，只允许纯输入（let）与绑定（Binding）。
+        holders = re.findall(
+            r"@(State|FocusState|StateObject|ObservedObject|GestureState)\b", btn)
+        c.check(not holders,
+                "按钮内部不持有任何可变焦点状态（单一真源 = 父级 FocusState）",
+                str(sorted(set(holders))))
+        # 焦点读数只能来自传入的绑定，不能拼别的来源
+        fields = re.findall(r"private var isFocused[^\n]*", btn)
+        c.check(len(fields) == 1 and "focus.wrappedValue" in fields[0]
+                and "||" not in fields[0] and "&&" not in fields[0],
+                "isFocused 只由父级绑定决定（不叠加本地状态）",
+                fields[0].strip()[:80] if fields else "未定义 isFocused")
 
-    # 调用处必须把所有按钮绑到 $focus
     call_count = len(re.findall(r"CircleButton\(", src))
     bound = len(re.findall(r"focus:\s*\$focus", src))
     c.check(call_count > 0 and call_count == bound,
             f"{call_count} 个按钮全部传入 $focus", f"实际绑定 {bound}")
 
-    # 按钮行必须是独立 focusSection，否则会和控制层外的元素混排
     c.check(".focusSection()" in src, "按钮行声明 focusSection")
 
-    # ─────────────────────────── 5. 无残留死代码
-    print("\n== 5. 无冲突残留 ==")
+    # ─────────────────────────── 7. 无残留死代码
+    print("\n== 7. 无冲突残留 ==")
     for dead in ("ClickToToggleModifier", "ActivateToToggleModifier", "TapCatcher"):
         c.check(dead not in src, f"已移除旧手势方案 {dead}")
 
-    # showControls 变化时必须清焦点
-    c.check(re.search(
-        r"\.onChange\(of:\s*showControls\)[\s\S]{0,200}?focus\s*=\s*nil", src)
-        is not None,
-        "showControls 变 false 时清空焦点")
+    # v3 的 showControls 布尔量必须彻底消失，否则和 level 双真源
+    c.check(re.search(r"\bshowControls\b", src) is None,
+            "不再存在 showControls 布尔量（与 level 双真源）")
 
     return c.report("播放器交互契约")
 

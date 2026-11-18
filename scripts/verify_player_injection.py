@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""verify_player.py 的变异测试：证明 34 条断言真的能失败。
+"""verify_player.py 的变异测试：证明每条断言真的能失败。
 
 ## 两类注入
 
 A. **回放历史缺陷**（最重要）
-   把 v1 / v2 的原始错误写法还原回源码，确认门禁能抓住它们。
+   把 v1 / v2 / v3 的原始错误写法还原回源码，确认门禁能抓住它们。
    如果连当年真出过的 bug 都抓不住，这套断言就没有存在意义。
+
+   v3 的缺陷特别值得回放：它把方向键挂在 `onMoveCommand` 上，
+   而控制层隐藏时没有任何可聚焦元素 —— 那段
+   `case .up, .down: revealControls()` 是死代码。静态读代码完全正常，
+   只有真机上发现"按键毫无反应"才会暴露。所以 v4 必须把断言钉在
+   "存在常驻焦点锚点 + pressesBegan 接管"上，而不是钉在
+   "handleMove 里有 reveal 分支"上 —— 后者 v3 就满足，却是有病的。
 
 B. **逐条破坏**
    针对每条断言做最小破坏，确认对应项变红。
@@ -41,8 +48,8 @@ def with_patch(old: str, new: str, label: str, expect: str | tuple[str, ...],
     """改一处 → 跑校验 → 还原。
 
     expect 可以是多个候选关键字：一处破坏往往会让"上游"断言先失败
-    （例如删掉整个早退分支后，报的是「早退分支不存在」而不是
-    「分支内不调用 seek」——后者已无从判断）。
+    （例如删掉整个分支后，报的是「分支不存在」而不是「分支内做了什么」
+    —— 后者已无从判断）。
     只要命中其中任意一条，就证明门禁确实在盯着这个缺陷。
     """
     keys = (expect,) if isinstance(expect, str) else expect
@@ -82,113 +89,231 @@ def main() -> int:
 
     print("\n== A. 回放历史缺陷 ==")
 
-    # A1: v1 —— 全局拦截左右键，无仲裁
+    # A1: v3 致命缺陷 —— 删掉焦点锚点，方向键再也进不来。
+    #     这就是用户报的"控制层一旦自动隐藏就调不出来"。
+    #     注意：此时 handleMove 里的 up/down 分支依然完整存在，
+    #     静态逻辑无懈可击，但按键永远到不了 —— 正因如此，
+    #     断言必须钉在锚点上，不能钉在分支上。
     with_patch(
-        """        // ── 选键态 ──
-        // 左右/上交给焦点引擎做按钮间移动，这里绝不 seek。
-        // 只接管「下」：收起控制层，回到看片态。
-        if isFocusInControls {
-            if direction == .down { collapseControls() }
-            return
-        }""",
-        """        // v1 缺陷回放：无条件 seek，焦点永远进不了按钮
-        if direction == .left { seek(-15) }
-        if direction == .right { seek(15) }""",
-        "A1 回放 v1（左右键无仲裁，必 seek）",
-        ("存在 isFocusInControls 早退分支",
-         "焦点在控制层时分支内不调用 seek"),
+        """    override var canBecomeFocused: Bool { capturesKeys }""",
+        """    override var canBecomeFocused: Bool { false }""",
+        "A1 回放 v3（锚点不可聚焦，方向键永不派发）",
+        "canBecomeFocused 是动态的",
         results)
 
-    # A2: v2 —— 焦点状态用 @State 存 + 上报回执，且失焦不清
+    # A2: v3 —— 只保留 onMoveCommand，不用 pressesBegan
     with_patch(
-        """    private var isFocusInControls: Bool { focus != nil }""",
-        """    @State private var focusInControls = false
-    private var isFocusInControls: Bool { focusInControls }""",
-        "A2 回放 v2（焦点状态存 @State）",
-        "不存在独立的 @State focusInControls",
+        """    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {""",
+        """    override func _removed_pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {""",
+        "A2 回放 v3（按钮不接管 pressesBegan）",
+        "在 pressesBegan 里接管方向键",
         results)
 
-    # A3: v2 —— 恢复 onFocusChange 回调方案
+    # A3: v1 —— 按钮态也霸占焦点，左右永远在 seek
     with_patch(
-        """            .focused(focus, equals: tag)""",
-        """            .focused(focus, equals: tag)
-            .onChange(of: isFocused) { v in onFocusChange(v) }""",
-        "A3 回放 v2（onFocusChange 上报回调）",
-        "不存在 onFocusChange 上报回调",
+        """    override var canBecomeFocused: Bool { capturesKeys }""",
+        """    override var canBecomeFocused: Bool { true }""",
+        "A3 回放 v1（锚点常驻可聚焦，按钮永远聚焦不上）",
+        "canBecomeFocused 是动态的",
         results)
 
-    # A4: 控制层不可恢复 —— 上下键不再呼出
+    # A4: v2 —— 焦点另存一份本地状态（双真源）。
+    #     实测教训：早先断言写的是 `"@FocusState" not in btn`，
+    #     而注入的是 `@State`——子串不含，断言一次都没红过。
+    #     现在断言同时盯「有无任何可变属性包裹器」与「isFocused 是否只由
+    #     父级绑定决定」，两种写法都能抓住。
     with_patch(
-        """        case .up, .down:
-            revealControls(focusPlay: true)""",
-        """        case .up, .down:
-            break""",
-        "A4 上下键不再呼出控制层",
-        "handleMove 内能呼出控制层",
+        """        private var isFocused: Bool { focus.wrappedValue == tag }""",
+        """        @State private var ownFocusFlag = false
+        private var isFocused: Bool { focus.wrappedValue == tag || ownFocusFlag }""",
+        "A4 回放 v2（按钮内部存 @State 焦点）",
+        ("按钮内部不持有任何可变焦点状态", "isFocused 只由父级绑定决定"),
+        results)
+
+    # A4b: v2 的等价写法 —— 用 @FocusState 自持（原断言唯一能抓的形态，
+    #      保留它，防止修 A4 时把这半边的覆盖丢掉）
+    with_patch(
+        """        private var isFocused: Bool { focus.wrappedValue == tag }""",
+        """        @FocusState private var inner: Bool
+        private var isFocused: Bool { focus.wrappedValue == tag || inner }""",
+        "A4b 回放 v2（按钮内部 @FocusState 自持）",
+        ("按钮内部不持有任何可变焦点状态", "isFocused 只由父级绑定决定"),
+        results)
+
+    # A5: v3 —— 把三级压回布尔量，进度条/按钮不再分离
+    with_patch(
+        """    @State private var level: Level = .progress""",
+        """    @State private var level: Level = .progress
+    @State private var showControls = true""",
+        "A5 回放 v3（同时保留 showControls 布尔量）",
+        "不再存在 showControls 布尔量",
         results)
 
     print("\n== B. 逐条破坏 ==")
 
-    # B1: collapseControls 不清焦点
+    # B1: 下键不再展开到按钮层（停在进度条）。
+    #     早先断言查 `".progress" in down_body and ".buttons" in down_body`，
+    #     掏空这一格后 `case .buttons:` 这个标签仍含 ".buttons" —— 假 PASS。
+    #     现在断言精确切到 `.progress` 那一格里找赋值语句。
     with_patch(
-        """        focus = nil
-        withAnimation { showControls = false }""",
-        """        withAnimation { showControls = false }""",
-        "B1 collapseControls 忘记清焦点",
-        "先释放焦点再收层",
+        """            case .progress:
+                withAnimation { level = .buttons }""",
+        """            case .progress:
+                break""",
+        "B1 下键不再展开按钮层",
+        ("下键逐级展开到按钮层", "下键用三级 switch 仲裁"),
         results)
 
-    # B2: scheduleHide 守卫去掉焦点检查
+    # B1b: 把整个 .down 分支的反向分支删掉（下键语义退化成布尔反转）
     with_patch(
-        """            guard engine.state == .playing,
-                  focus == nil,
-                  !showInspector else { return }""",
-        """            guard engine.state == .playing,
-                  !showInspector else { return }""",
-        "B2 自动隐藏不再检查焦点",
-        "自动隐藏前检查焦点",
+        """            case .hidden:
+                withAnimation { level = .progress }
+            case .progress:
+                withAnimation { level = .buttons }""",
+        """            case .hidden:
+                withAnimation { level = .buttons }
+            case .progress:
+                withAnimation { level = .buttons }""",
+        "B1b 下键跳过进度条直接进按钮",
+        "下键在隐藏态呼出进度条",
         results)
 
-    # B2b: scheduleHide 守卫去掉播放状态检查（暂停时也隐藏）
+    # B2: 上键在隐藏态不呼出。
+    #     同上，`case .progress, .buttons:` 含 ".progress"，
+    #     掏空 `.hidden` 那格后子串判断依然是绿的。
     with_patch(
-        """            guard engine.state == .playing,
-                  focus == nil,""",
-        """            guard focus == nil,""",
-        "B2b 自动隐藏不再检查播放状态",
+        """            case .hidden:
+                withAnimation { level = .progress }
+            case .progress, .buttons:
+                withAnimation { level = .hidden }""",
+        """            case .hidden:
+                break
+            case .progress, .buttons:
+                withAnimation { level = .hidden }""",
+        "B2 上键在隐藏态不呼出进度条",
+        "上键在隐藏态也能呼出进度条",
+        results)
+
+    # B2b: 当前用户报的那个 bug 本身 —— 上下键完全不响应
+    with_patch(
+        """        case .up:
+            // **上下键都能呼出进度条**（用户明确要求）。
+            // 已经在控制层里时，上 = 收起。
+            switch level {
+            case .hidden:
+                withAnimation { level = .progress }
+            case .progress, .buttons:
+                withAnimation { level = .hidden }
+            }""",
+        """        case .up:
+            break""",
+        "B2b 回放用户报的 bug（上键完全失效）",
+        ("handleMove 有 .up 分支", "上键在隐藏态也能呼出进度条"),
+        results)
+
+    # B3: 自动隐藏不再检查播放状态
+    with_patch(
+        """            guard engine.state == .playing else { return }""",
+        """            // 注入：不检查播放状态""",
+        "B3 自动隐藏不再检查播放状态",
         "自动隐藏前检查是否正在播放",
         results)
 
-    # B3: 手势不随控制层禁用（双击 bug）
+    # B4: 自动隐藏不再检查按钮焦点
+    with_patch(
+        """            if level == .buttons && focus != nil { return }""",
+        """            // 注入：不检查焦点""",
+        "B4 自动隐藏不再检查按钮焦点",
+        "自动隐藏前检查按钮焦点",
+        results)
+
+    # B5: 手势永远启用（双击 bug）
     with_patch(
         """        context.coordinator.tapGesture?.isEnabled = tapEnabled""",
         """        // 注入：手势永远启用""",
-        "B3 手势不随控制层禁用",
+        "B5 手势不随控制层禁用",
         "updateUIView 同步手势启用状态",
         results)
 
-    # B4: 按钮改回自带 @FocusState（双真源）
+    # B6: 进度条层塞进按钮行（三级退化成两级）
     with_patch(
-        """        let focus: FocusState<PlayerView.Control?>.Binding""",
-        """        @FocusState private var ownFocus: Bool
-        let focus: FocusState<PlayerView.Control?>.Binding""",
-        "B4 按钮自带 @FocusState（双真源）",
-        "按钮内部不再持有独立 @FocusState",
+        """    private var progressLayer: some View {
+        VStack {
+            Spacer()
+            progressBar""",
+        """    private var progressLayer: some View {
+        VStack {
+            Spacer()
+            progressBar
+            controlButtons""",
+        "B6 进度条层混入按钮行",
+        "进度条层不含按钮行",
         results)
 
-    # B5: seek 增量改错
+    # B7: seek 步长改错
     with_patch(
         """            seek(-15)""",
         """            seek(-30)""",
-        "B5 seek 步长改为 -30",
-        "看片态左右分别为",
+        "B7 seek 步长改为 -30",
+        "左右分别为",
         results)
 
-    # B6: 去掉 focusSection
+    # B8: 去掉 focusSection
     with_patch(
         """        .focusSection()""",
         """        """,
-        "B6 移除 focusSection",
+        "B8 移除 focusSection",
         "focusSection",
+        results)
+
+    # B9: 焦点丢失兜底被删（再次陷入无焦点死区）
+    with_patch(
+        """            if level == .buttons && newFocus == nil {
+                withAnimation { level = .progress }
+            }""",
+        """            // 注入：焦点丢失后不兜底""",
+        "B9 焦点丢失后不退回进度条态",
+        "焦点意外丢失时退回进度条态",
+        results)
+
+    # B10: 切回锚点态不主动要焦点。
+    #     源码里 setNeedsFocusUpdate 有两处（updateUIView 与
+    #     didMoveToWindow），早先断言查"全文有没有这个词"，
+    #     删掉 updateUIView 这处仍命中另一处 —— 假 PASS。
+    #     现在断言只在 updateUIView 函数体内找。
+    #     这里注入的是「条件退化成每帧都要焦点」——它不会少要焦点，
+    #     反而每帧都要一次，表现是焦点被反复重置、按钮点不动。
+    #     专门用来验证第二条断言（跃迁判定）不是装饰。
+    with_patch(
+        """        if capturesKeys && !wasCapturing {""",
+        """        if capturesKeys {""",
+        "B10 跃迁判定退化成每帧都要焦点",
+        "只在「按钮态 → 锚点态」",
+        results)
+
+    # B10b: 只删焦点请求、保留跃迁判定（不引爆上游断言，只能靠这一条抓）
+    with_patch(
+        """            uiView.setNeedsFocusUpdate()
+            uiView.updateFocusIfNeeded()""",
+        """            _ = wasCapturing""",
+        "B10b 只删焦点请求语句",
+        "切回锚点态时主动请求焦点更新",
+        results)
+
+    # B11: 按钮态不放行按键（按钮永远点不动）
+    with_patch(
+        """        guard capturesKeys else {""",
+        """        guard true else {""",
+        "B11 pressesBegan 不放行按键",
+        "pressesBegan 在非捕获态放行按键",
+        results)
+
+    # B12: 焦点光晕没关（整屏视频一圈白光）
+    with_patch(
+        """    override var focusEffect: UIFocusEffect? { nil }""",
+        """    override var focusEffect: UIFocusEffect? { .automatic }""",
+        "B12 焦点光晕未关闭",
+        "focusEffect 为 nil",
         results)
 
     print()

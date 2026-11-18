@@ -178,93 +178,125 @@ python3 scripts/verify_injection.py # 反向注入，证明断言能失败
 
 ---
 
-## 遥控器交互（三个已修缺陷）
+## 遥控器交互（分级控制层 · v1.0.1 重做）
 
-这三个是实测报上来的，都属于「看得见但编译期发现不了」：
+v1.0.0 交付后实测报了两个症状，看起来是两件事，其实是**同一个根因**：
 
-### 1. 方向键冲突：既想快进又想选按钮
+> 方向键不能控制播放进度了；进度条一旦自动隐藏就再也调不出来。
 
-**症状**：播放中按左右，有时快进 15 秒，有时在按钮间移动，取决于当时焦点在哪，
-用户无法预期。
+### 根因：`onMoveCommand` 是死代码
 
-**根因**：把「快进」和「按钮间移动」当成两个并行的手势去抢方向键。
-只要两者都能响应，就必然有歧义。
-
-**解法**：改成**互斥状态机**。焦点是否在控制层，用 `@FocusState` 的枚举值表示，
-`isFocusInControls` 是纯派生：
+v1.0.0 把方向键处理挂在 SwiftUI 的 `onMoveCommand` 上：
 
 ```swift
-enum Control: Hashable {
-    case rewind, previous, playPause, next, forward, mute, info, close
-}
-
-@FocusState private var focus: Control?
-
-// 纯派生，不存状态 —— 因此不可能残留成 true。
-private var isFocusInControls: Bool { focus != nil }
-```
-
-方向键只在**一个**地方仲裁：
-
-```swift
-private func handleMove(_ direction: MoveCommandDirection) {
-    if showInspector { return }
-
-    // ── 选键态 ──
-    // 左右/上交给焦点引擎做按钮间移动，这里绝不 seek。
-    if isFocusInControls {
-        if direction == .down { collapseControls() }
-        return
-    }
-
-    // ── 看片态 ──
-    switch direction {
-    case .left:  seek(-15)
-    case .right: seek(15)
-    case .up, .down:
-        revealControls(focusPlay: true)
-    @unknown default: break
-    }
-}
-```
-
-顺带解决了另一个隐蔽 bug：按钮不再各自持有 `@FocusState`，而是绑定父级的同一个，
-所以「焦点在哪」永远只有一个真相来源。
-
-### 2. 控制层自动隐藏后调不出来
-
-**症状**：播放中控制层 5 秒后自动隐藏，此后按任何键都唤不回。
-
-**根因**：两处叠加 ——
-(a) 看片态没有「唤回」的处理分支，方向键什么都不做；
-(b) 自动隐藏只看时间，不看焦点，用户正在选按钮时面板也会消失。
-
-**解法**：
-
-```swift
-// 看片态下任何方向键都能唤回（左右顺手快进，上下直接呼出）
-case .left:  seek(-15)
-case .right: seek(15)
+// v1.0.0 的写法 —— 静态看完全正确，运行时一次都不执行
 case .up, .down:
     revealControls(focusPlay: true)
 ```
 
+`onMoveCommand` **依赖焦点**。控制层隐藏时 `focus = nil`，而承载视频的
+`UIViewRepresentable` 当时 `canBecomeFocused = false` —— 整棵视图树里
+没有任何可聚焦元素。tvOS 的焦点引擎找不到派发目标，方向键直接丢弃，
+那段 `case .up, .down` 永远不会执行。
+
+于是：「进度条调不出来」＝ 按键进不来；「方向键控不了进度」＝ 同一个按键
+进不来。**一个根因，两个症状。** 这类缺陷编译期、静态审阅都发现不了 ——
+分支逻辑写着，只有真机上按下去毫无反应才暴露。
+
+### 解法：常驻焦点锚点 + 三级累进
+
+**① 画面层自己当焦点锚点，并且用 `pressesBegan` 直接抓按键**（不依赖焦点派发）：
+
 ```swift
-private func scheduleHide() {
-    hideTask?.cancel()
-    hideTask = Task { @MainActor in
-        try? await Task.sleep(nanoseconds: 5_000_000_000)
-        guard !Task.isCancelled else { return }
-        // 焦点还在按钮上、或者已经暂停了，就不该隐藏
-        guard engine.state == .playing,
-              focus == nil,
-              !showInspector else { return }
-        withAnimation { showControls = false }
+final class PlayerContainerView: UIView {
+    var capturesKeys = true
+    var onKey: ((KeyEvent) -> Void)?
+
+    // 动态：按钮态必须让位，否则全屏锚点一直霸占焦点，按钮永远聚焦不上
+    override var canBecomeFocused: Bool { capturesKeys }
+
+    // 不要焦点光晕（tvOS 默认给可聚焦 view 画一圈白边 + 缩放）
+    override var focusEffect: UIFocusEffect? { nil }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        guard capturesKeys else {          // 按钮态一律放行给焦点引擎
+            super.pressesBegan(presses, with: event)
+            return
+        }
+        for press in presses {
+            guard let type = press.type else { continue }
+            switch type {
+            case .upArrow:    onKey?(.move(.up));    return
+            case .downArrow:  onKey?(.move(.down));  return
+            case .leftArrow:  onKey?(.move(.left));  return
+            case .rightArrow: onKey?(.move(.right)); return
+            case .playPause:  onKey?(.playPause);    return
+            case .menu:       onKey?(.menu);         return
+            default: continue
+            }
+        }
+        super.pressesBegan(presses, with: event)
     }
 }
 ```
 
-另外补了两条兜底：按播放/暂停键、按返回键都会先把控制层拉回来。
+**② 三级累进状态机**，每级按键含义不重叠：
+
+```swift
+enum Level: Int, Comparable {
+    case hidden = 0      // 只有画面
+    case progress = 1    // 进度条 + 时间
+    case buttons = 2     // 进度条 + 按钮行
+    static func < (a: Level, b: Level) -> Bool { a.rawValue < b.rawValue }
+}
+
+@State private var level: Level = .progress
+```
+
+| 当前状态 | 按 ↑ | 按 ↓ | 按 ← / → |
+|---|---|---|---|
+| 看片（hidden） | → 进度条 | → 进度条 | seek ∓15 秒 |
+| 进度条（progress） | → 收起 | → **展开按钮行** | seek ∓15 秒 |
+| 按钮（buttons） | — | — | 按钮间移动（焦点引擎接管） |
+
+用户要求的三条逐一对应：上下键都能呼出进度条 ✅；进度条下左右键快进/快退 ✅；
+进度条下再按下键出现「上一首 / 下一首 / 暂停 / 投屏停止」按钮行 ✅。
+
+**③ 两态互斥，不做运行时仲裁**。按钮态把 `capturesKeys` 与
+`canBecomeFocused` 一起关掉，焦点整块交给 SwiftUI 的 `@FocusState`；
+退出按钮态时再打开，并主动要一次焦点：
+
+```swift
+// updateUIView 里
+let wasCapturing = uiView.capturesKeys
+uiView.capturesKeys = capturesKeys
+if capturesKeys && !wasCapturing {
+    uiView.setNeedsFocusUpdate()      // 不要这一次，控制层收起了但方向键仍无反应
+    uiView.updateFocusIfNeeded()
+}
+```
+
+**④ 三条兜底**，防止再次掉进无焦点死区：
+
+- `didMoveToWindow` 首次上屏主动要焦点（否则第一下按键丢失）
+- `.onChange(of: focus)`：按钮态下焦点意外变 nil → 退回进度条态
+- `restartHide()` 的三条守卫：正在播放 && 无按钮焦点 && 检查器未开 才自动隐藏
+
+### 为什么这一版值得信
+
+`scripts/verify_player.py` 有 **49 条**断言，`scripts/verify_player_injection.py`
+逐条注入破坏（**22 项变异 + 1 项 plist 格式**），确认每条断言真的能失败。
+其中 4 条是 v1.0.0 那批「假 PASS」的教训：
+
+| 变异 | 旧断言为什么抓不住 | 新判据 |
+|---|---|---|
+| 按钮内部存 `@State` 焦点 | 查的是 `"@FocusState" not in btn`，`@State` 不含这个子串 | 列出全部可变属性包裹器，一个不许有 |
+| 下键不展开按钮层 | 查 `".buttons" in down_body`，`case .buttons:` **标签本身**就命中 | 按花括号深度切出 `.progress` 那一格再找赋值 |
+| 上键隐藏态不呼出 | 同上，`case .progress, .buttons:` 含 `.progress` | 精确切到 `.hidden` 那一格 |
+| 切回锚点态不请求焦点 | 查全文有无 `setNeedsFocusUpdate`，`didMoveToWindow` 里还有一处 | 只在 `updateUIView` 函数体内找 |
+
+一次 `python3 scripts/verify_player.py && python3 scripts/verify_player_injection.py`
+就能复现全部结论。
 
 ### 3. 没有图标
 
