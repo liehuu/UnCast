@@ -308,12 +308,40 @@ def main() -> int:
         "pressesBegan 在非捕获态放行按键",
         results)
 
-    # B12: 焦点光晕没关（整屏视频一圈白光）
+    # B12: 焦点光晕没关（整屏视频一圈白光）。
+    #     注意不能注入 `focusEffect = .automatic`：`UIFocusEffect` 在
+    #     tvOS 上是 API_UNAVAILABLE，那种写法连编译都过不去，
+    #     拿它当变异体是伪命题。这里注入的 `focusEffect = nil` 赋值
+    #     同样编译不过，但它模拟的是"有人试图用 iOS 手段关光晕"，
+    #     断言拦的是"根本不许碰这个 API"。
     with_patch(
-        """    override var focusEffect: UIFocusEffect? { nil }""",
-        """    override var focusEffect: UIFocusEffect? { .automatic }""",
-        "B12 焦点光晕未关闭",
-        "focusEffect 为 nil",
+        """    override func didUpdateFocus(in context: UIFocusUpdateContext,
+                                 with coordinator: UIFocusAnimationCoordinator) {
+        // 故意不调 super：本层没有任何需要跟着焦点变化的视觉
+    }""",
+        """    // 注入：不再堵焦点动画，且用 iOS 手段关光晕
+    override var focusEffect: UIFocusEffect? { nil }""",
+        "B12 改回 iOS 的 focusEffect 写法（tvOS 编译不过）",
+        ("不引用 UIFocusEffect", "覆写 didUpdateFocus"),
+        results)
+
+    # B12b: 直接给 view 设焦点效果（等效于画光晕）
+    with_patch(
+        """        view.isUserInteractionEnabled = true""",
+        """        view.isUserInteractionEnabled = true
+        view.focusEffect = nil""",
+        "B12b 给 view 设 focusEffect",
+        "不给 view 设焦点效果",
+        results)
+
+    # B13: 回放 iOS 写法 press.type 当可选 —— 编译期错误，
+    #      Gate 必须在打包前就拦住，不能等 CI 编译失败才发现。
+    with_patch(
+        """            switch press.type {""",
+        """            guard let type = press.type else { continue }
+            switch type {""",
+        "B13 press.type 当可选（iOS 写法，tvOS 编译不过）",
+        "不把 press.type 当可选",
         results)
 
     print()

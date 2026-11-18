@@ -73,6 +73,20 @@ jobs:
           echo "---- 生成结果 ----"
           ls -la UnCast.xcodeproj
 
+      - name: Gate 0 — tvOS API 可用性（编译前拦住 iOS 写法）
+        run: |
+          # 2026-11-18 run #44215207929 一次报了三条 iOS/tvOS 差异错误：
+          #   error: cannot override mutable property with read-only
+          #          property 'focusEffect'
+          #   error: 'UIFocusEffect' is unavailable in tvOS
+          #   error: initializer for conditional binding must have
+          #          Optional type, not 'UIPress.PressType'
+          # 本机是 Windows、没有 Xcode，编译器反馈只能靠 CI 一次次来回。
+          # 这个 Gate 把这类错误提前到编译之前，几秒出结果。
+          python3 scripts/check_tvos_api.py
+          # 反向验证：注入 CI 当时的真实错误原文，确认规则真的会红。
+          python3 scripts/selftest_check_tvos_api.py
+
       - name: Build (unsigned)
         run: |
           set -o pipefail

@@ -747,12 +747,23 @@ final class PlayerContainerView: UIView {
     /// 一直霸着焦点，按钮永远聚焦不上，左右键也就永远在 seek。
     override var canBecomeFocused: Bool { capturesKeys }
 
-    /// 不要焦点外观。
+    /// 不参与焦点动画。
     ///
-    /// tvOS 给可聚焦 view 默认画一圈白色光晕 + 轻微放大，在整屏视频上
-    /// 会非常突兀。UIView 默认 `focusEffect` 就是 nil，这里显式写出来
-    /// 是为了防止哪天有人给父类加了效果而这里跟着继承。
-    override var focusEffect: UIFocusEffect? { nil }
+    /// 这里踩过一个坑，值得写清楚：原本写的是
+    /// `override var focusEffect: UIFocusEffect? { nil }`，
+    /// 编译直接失败 —— `UIFocusEffect` 在 tvOS 上是
+    /// `API_UNAVAILABLE(tvos)`（只有 iOS 15+ 提供），而且
+    /// `UIView.focusEffect` 在 tvOS 上不可覆写。
+    ///
+    /// 实际上也**不需要**它：整屏白光晕是 `UIButton` 与 SwiftUI
+    /// 的 `.focusable()` 才有的默认焦点外观；这里是裸 `UIView` +
+    /// `AVPlayerLayer`，本来就不画任何焦点效果。
+    /// 覆盖 `didUpdateFocus` 只是把动画协调器这条路也堵上，
+    /// 双保险，避免系统在某个版本上给裸 view 加回动效。
+    override func didUpdateFocus(in context: UIFocusUpdateContext,
+                                 with coordinator: UIFocusAnimationCoordinator) {
+        // 故意不调 super：本层没有任何需要跟着焦点变化的视觉
+    }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -772,8 +783,12 @@ final class PlayerContainerView: UIView {
         }
 
         for press in presses {
-            guard let type = press.type else { continue }
-            switch type {
+            // tvOS 上 `UIPress.type` 是**非可选**的 UIPress.PressType
+            // （iOS 上才是可选）。写成 `guard let type = press.type`
+            // 会报 "initializer for conditional binding must have
+            // Optional type" —— 编译期就能拦住，但本机没有 Xcode，
+            // 只能靠 CI 暴露，所以这里留注释说明。
+            switch press.type {
             case .upArrow:
                 onKey?(.move(.up)); return
             case .downArrow:

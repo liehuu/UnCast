@@ -278,16 +278,32 @@ def main() -> int:
     if pb:
         for key in (".upArrow", ".downArrow", ".leftArrow", ".rightArrow"):
             c.check(key in pb, f"pressesBegan 处理 {key}")
+        # tvOS 的 UIPress.type 是非可选的，写 `guard let type = press.type`
+        # 直接编译失败（CI run #44215207929 真实报错）。断言必须拦住它，
+        # 否则源码一旦回退成 iOS 写法，Gate 全绿但编译红。
+        c.check(re.search(r"guard\s+let\s+\w+\s*=\s*press\.type", pb) is None,
+                "不把 press.type 当可选（tvOS 上非 Optional，guard let 编译不过）")
 
     # 关键互斥：按钮态必须放行按键，否则按钮永远聚焦不上
     c.check(re.search(r"guard\s+capturesKeys\s+else\s*\{", pb) is not None,
             "pressesBegan 在非捕获态放行按键（按钮态让位焦点引擎）",
             pb.strip()[:80] if pb else "")
 
-    # 焦点外观必须关掉，否则整屏视频会有一圈白光晕
-    c.check(re.search(r"override\s+var\s+focusEffect\s*:\s*UIFocusEffect\?\s*\{\s*nil\s*\}",
-                      src) is not None,
-            "focusEffect 为 nil（全屏视频不画焦点光晕）")
+    # 焦点外观必须关掉，否则整屏视频会有一圈白光晕。
+    #
+    # 注意 tvOS 的现实（CI run #44215207929 真实失败）：
+    #   - `UIFocusEffect` 是 API_UNAVAILABLE(tvos)，只有 iOS 15+ 有
+    #   - `UIView.focusEffect` 在 tvOS 上不可覆写
+    # 所以绝不能把 `override var focusEffect: UIFocusEffect? { nil }`
+    # 钉成"必须存在"——那等于把源码逼到编译不过。
+    # tvOS 上真正成立的判据是：不引入任何焦点外观 API，
+    # 并且堵住 didUpdateFocus 的动画协调器。
+    c.check(re.search(r"\bUIFocusEffect\b", src) is None,
+            "不引用 UIFocusEffect（tvOS 上 API_UNAVAILABLE，写了就编译不过）")
+    c.check(re.search(r"\bfocusEffect\s*=", src) is None,
+            "不给 view 设焦点效果（裸 UIView 本就不画光晕）")
+    c.check("override func didUpdateFocus" in src,
+            "覆写 didUpdateFocus 堵住焦点动画协调器（全屏视频不画光晕）")
 
     # ─────────────────────────── 2. 三级累进状态机
     print("\n== 2. 控制层必须是三级累进 ==")
