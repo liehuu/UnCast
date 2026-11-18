@@ -33,31 +33,31 @@ UnPlay 的开源替代实现。用 UPnP/DLNA 标准协议接收手机投屏，tv
 
 ### 已构建好的包
 
-仓库 `dist/UnCast-1.0.0.tipa` 就是可直接安装的成品（由 GitHub Actions 构建）。
+仓库 `dist/UnCast-1.0.1.tipa` 就是可直接安装的成品（由 GitHub Actions 构建）。
 
 | 项 | 值 |
 |---|---|
-| 大小 | 3,664,105 字节（3.49 MB） |
-| sha256 | `a23a51206af40a921a7032be6faf48fc058d923894c54c49e61d742be96f47ca` |
+| 版本 | 1.0.1（build 2） |
+| 大小 | 3,667,587 字节（3.50 MB） |
+| sha256 | `83e1bfb422a58299bc28e44e52f21615157a21d909830004c3a562a0274c9566` |
 | 架构 | arm64 |
 | 平台 | tvOS（`LC_BUILD_VERSION.platform = 3`，minos 15.0） |
 | 加密 | 未加密（`cryptid = 0`） |
 | 签名 | ad-hoc（含 `LC_CODE_SIGNATURE`，dataSize > 0） |
 | 多播权限 | `com.apple.developer.networking.multicast = true` |
 | 主屏图标 | 内置，橘黄渐变主题（`Assets.car` 3.17 MB，9 条 rendition） |
-| 构建 | GitHub Actions run #37（`28c35beb`），17 步全绿 |
-
-下载：<https://github.com/liehuu/UnCast/releases/download/v1.0.0/UnCast-1.0.0.tipa>
+| 构建 | GitHub Actions run #44216056335（`df995044`），18 步全绿 |
 
 上述指标是读 tipa 内二进制的原始字节实测得出，可用
 `python3 scripts/check_tipa.py <tipa>` 自行复现（16 项断言）。
-sha256 已通过「匿名下载回来再比对」验证，不是只信上传返回码。
 
-> 包体从 1.67 MB 涨到 3.49 MB，是因为图标从深色单调渐变改成了
-> 三色高饱和渐变加高光 —— 画面越复杂 PNG 压缩率越低。3.5 MB 对
-> TrollStore 安装没有影响，主屏显示也只会用其中最小的那档（400×240）。
+**1.0.1 修的是遥控器交互**：方向键上下呼出进度条、进度条下左右快进/快退、
+进度条下再按下键展开按钮行。完整说明见下文「遥控器交互」。
 
-> 包体从 1.67 MB 涨到 3.49 MB，是因为图标从深色单调渐变改成了
+> 直接从 1.0.0 覆盖安装即可，不需要先卸载 —— bundle id 未变，
+> 设置与播放记录都会保留。
+
+> 包体从 1.67 MB 涨到 3.50 MB，是因为图标从深色单调渐变改成了
 > 三色高饱和渐变加高光 —— 画面越复杂 PNG 压缩率越低。3.5 MB 对
 > TrollStore 安装没有影响，主屏显示也只会用其中最小的那档（400×240）。
 
@@ -97,7 +97,7 @@ python3 scripts/check_icon.py .            # 34 项校验
 
 1. 把 `UnCast-1.0.0.tipa` 传到 iPhone / iPad，或用「文件」App 存到 iCloud Drive
 2. 在 Apple TV 上打开 TrollStore → **Install from File**（或通过 Filza / 局域网上传）
-3. 选中 `UnCast-1.0.0.tipa` → 安装
+3. 选中 `UnCast-1.0.1.tipa` → 安装
 4. 首次启动会询问「本地网络」权限，**必须允许**，否则收不到投屏
 
 > 为什么不用 App Store 的 ipa：App Store 下发的 tvOS 二进制带 FairPlay 加密
@@ -284,8 +284,8 @@ if capturesKeys && !wasCapturing {
 
 ### 为什么这一版值得信
 
-`scripts/verify_player.py` 有 **49 条**断言，`scripts/verify_player_injection.py`
-逐条注入破坏（**22 项变异 + 1 项 plist 格式**），确认每条断言真的能失败。
+`scripts/verify_player.py` 有 **55 条**断言，`scripts/verify_player_injection.py`
+逐条注入破坏（**25 项变异 + 1 项 plist 格式**），确认每条断言真的能失败。
 其中 4 条是 v1.0.0 那批「假 PASS」的教训：
 
 | 变异 | 旧断言为什么抓不住 | 新判据 |
@@ -297,6 +297,36 @@ if capturesKeys && !wasCapturing {
 
 一次 `python3 scripts/verify_player.py && python3 scripts/verify_player_injection.py`
 就能复现全部结论。
+
+### 一条更深的教训：断言写错比代码写错更致命
+
+第一版修完后本机 Gate 全绿，CI 编译却失败，一次报三条：
+
+```
+error: cannot override mutable property with read-only property 'focusEffect'
+error: 'UIFocusEffect' is unavailable in tvOS
+error: initializer for conditional binding must have Optional type,
+       not 'UIPress.PressType'
+```
+
+根因不是手误。是我在断言里写了「`focusEffect` 必须为 `nil`」，
+而 `UIFocusEffect` 在 tvOS 上是 `API_UNAVAILABLE(tvos)`（只有 iOS 15+ 提供），
+`UIView.focusEffect` 在 tvOS 上也不可覆写 —— **在 tvOS 上唯一能满足
+那条断言的写法，恰好是编译不过的写法**。断言把源码逼进了死角。
+
+于是加了一整层前置校验，跑在编译之前：
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/check_tvos_api.py` | 4 条 tvOS API 可用性规则，每条注明 SDK 头文件出处 |
+| `scripts/selftest_check_tvos_api.py` | 注入上面那三条报错原文做反向验证（5 项） |
+
+写第一版规则时把 `focusEffectDisabled` 写成 `\.focusEffectDisabled\(`，
+只认链式调用、漏了裸调用形态；反向验证的 M4 当场变红，抓出了这条
+**永远为绿的规则**。这就是反向验证存在的意义。
+
+现在 CI 是 18 步：Gate 0（tvOS API）→ 编译 → 打包 → Gate 1（交互契约
++ 变异测试）→ Gate 2（图标进包）→ Gate 3（产物可装）。
 
 ### 3. 没有图标
 
